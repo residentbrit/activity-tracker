@@ -81,7 +81,7 @@ final class Database {
             try execute("""
                 CREATE TABLE screenshots (
                     event_id TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
-                    image_data BLOB NOT NULL,
+                    path TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
             """)
@@ -114,7 +114,18 @@ final class Database {
             try execute("INSERT INTO schema_version(version) VALUES (1)")
         }
 
-        // Future migrations: if current < 2 { ... }
+        if current < 2 {
+            // v2: Switch screenshots from BLOB to disk-based storage
+            try execute("DROP TABLE IF EXISTS screenshots")
+            try execute("""
+                CREATE TABLE screenshots (
+                    event_id TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            try execute("INSERT INTO schema_version(version) VALUES (2)")
+        }
     }
 
     // MARK: - Raw execution

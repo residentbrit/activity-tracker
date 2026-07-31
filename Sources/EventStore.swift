@@ -6,8 +6,12 @@ import SQLite3
 actor EventStore {
     private let db: Database
 
+    private let screenshotDir: String
+
     init(database: Database) {
         self.db = database
+        self.screenshotDir = "\(NSHomeDirectory())/.local/share/activity-tracker/screenshots"
+        try? FileManager.default.createDirectory(atPath: screenshotDir, withIntermediateDirectories: true)
     }
 
     // MARK: - Sessions
@@ -72,20 +76,37 @@ actor EventStore {
     // MARK: - Screenshots
 
     func saveScreenshot(eventId: String, imageData: Data) throws {
+        let path = "\(screenshotDir)/\(eventId).png"
+        try imageData.write(to: URL(fileURLWithPath: path))
         let sql = """
-            INSERT OR REPLACE INTO screenshots (event_id, image_data, created_at)
+            INSERT OR REPLACE INTO screenshots (event_id, path, created_at)
             VALUES (?, ?, datetime('now'))
         """
-        try execute(sql, params: [eventId, imageData])
+        try execute(sql, params: [eventId, path])
     }
 
     /// Purge screenshots older than configured retention hours (D8).
     func purgeOldScreenshots(retentionHours: Int) throws {
         let sql = """
-            DELETE FROM screenshots
+            SELECT event_id, path FROM screenshots
             WHERE created_at < datetime('now', '-\(retentionHours) hours')
         """
-        try execute(sql, params: [])
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        var toDelete: [(id: String, path: String)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let path = String(cString: sqlite3_column_text(stmt, 1))
+            toDelete.append((id, path))
+        }
+
+        for item in toDelete {
+            try? FileManager.default.removeItem(atPath: item.path)
+        }
+
+        try execute("DELETE FROM screenshots WHERE created_at < datetime('now', '-\(retentionHours) hours')", params: [])
     }
 
     // MARK: - Audio segments
