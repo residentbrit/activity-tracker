@@ -131,23 +131,12 @@ actor CaptureEngine {
         trigger: String, bundleID: String?, appName: String?, windowTitle: String?,
         image: CGImage
     ) async {
-        // Save screenshot blob immediately
-        if let pngData = image.pngData() {
-            do {
-                try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
-            } catch {
-                fputs("[CaptureEngine] screenshot save failed: \(error.localizedDescription)\n", stderr)
-            }
-        } else {
-            fputs("[CaptureEngine] pngData nil for event \(eventId)\n", stderr)
-        }
-
-        // Extract text — AX first, OCR fallback
+        // 1. Extract text — AX first, OCR fallback
         let result = await extractor.extract(from: image, bundleID: bundleID)
         let text = result.text
         let sourceType = result.source.rawValue
 
-        // Dedup + text diffing
+        // 2. Dedup + text diffing
         let dedupKey = text.simpleHash()
         if dedupKey == lastCaptureHash {
             try? await eventStore.insertEvent(
@@ -157,11 +146,15 @@ actor CaptureEngine {
                 sourceType: sourceType, textContent: text,
                 embedding: nil, dedupKey: dedupKey, isDuplicate: true
             )
+            // Still save screenshot for deduplicated events
+            if let pngData = image.pngData() {
+                try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+            }
             return
         }
         lastCaptureHash = dedupKey
 
-        // Diff against previous capture for this app — embed only new lines
+        // 3. Diff against previous capture for this app
         let textToEmbed: String
         let appKey = bundleID ?? "unknown"
         let newLines = Set(text.components(separatedBy: .newlines)
@@ -171,7 +164,6 @@ actor CaptureEngine {
         if let previousLines = previousTextByApp[appKey] {
             let diffLines = newLines.subtracting(previousLines)
             if diffLines.isEmpty {
-                // Text changed but no new lines (e.g. reordering) — embed the full text
                 textToEmbed = text
             } else {
                 textToEmbed = diffLines.sorted().joined(separator: "\n")
@@ -181,13 +173,13 @@ actor CaptureEngine {
         }
         previousTextByApp[appKey] = newLines
 
-        // Embed only the diff (or full text if first capture for this app)
+        // 4. Embed
         let embedding = await embedder.embed(textToEmbed)
-
         let filePath = extractFilePath(from: windowTitle, axText: text)
 
         fputs("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n", stderr)
 
+        // 5. Insert event FIRST (screenshots table has FK to events)
         try? await eventStore.insertEvent(
             id: eventId, sessionId: sessionId, capturedAt: capturedAt,
             trigger: trigger, appBundleID: bundleID, appName: appName,
@@ -195,6 +187,11 @@ actor CaptureEngine {
             sourceType: sourceType, textContent: text,
             embedding: embedding, dedupKey: dedupKey, isDuplicate: false
         )
+
+        // 6. Save screenshot AFTER event exists
+        if let pngData = image.pngData() {
+            try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+        }
     }
 
     // MARK: - Screen capture
