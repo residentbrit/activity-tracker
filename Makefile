@@ -4,8 +4,9 @@
 #   make install   Install to ~/.local/
 #   make clean     Remove build artifacts
 #
-# Prerequisites: Xcode Command Line Tools only.
+# Prerequisites: Xcode Command Line Tools + cmake (brew install cmake)
 #   xcode-select --install
+#   brew install cmake
 
 PREFIX      ?= $(HOME)/.local
 BIN_DIR     := $(PREFIX)/bin
@@ -59,16 +60,20 @@ run: all
 $(BINARY): $(shell find Sources -name '*.swift') Package.swift
 	$(SWIFT_BUILD)
 
-# --- llama.cpp (plain Makefile, Metal-accelerated on Apple Silicon) ---
-
+# llama.cpp — uses cmake (they dropped the plain Makefile)
 $(LLAMA_SRC):
 	git clone --depth 1 https://github.com/ggerganov/llama.cpp.git $(LLAMA_SRC)
 
 $(LLAMA_EMBED): $(LLAMA_SRC)
 	@echo "==> Building llama.cpp (llama-embedding) …"
-	cd $(LLAMA_SRC) && make llama-embedding LLAMA_METAL=1 -j$(NPROC)
+	cd $(LLAMA_SRC) && cmake -B build \
+		-DLLAMA_BUILD_EXAMPLES=ON \
+		-DLLAMA_BUILD_TESTS=OFF \
+		-DLLAMA_BUILD_SERVER=OFF \
+		-DGGML_METAL=ON
+	cd $(LLAMA_SRC) && cmake --build build --target llama-embedding -j$(NPROC)
 	mkdir -p $(dir $(LLAMA_EMBED))
-	cp $(LLAMA_SRC)/llama-embedding $(LLAMA_EMBED)
+	cp $(LLAMA_SRC)/build/bin/llama-embedding $(LLAMA_EMBED)
 
 # --- whisper.cpp (plain Makefile) ---
 
