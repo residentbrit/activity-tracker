@@ -187,9 +187,12 @@ actor CaptureEngine {
     // MARK: - Screen capture
 
     private func captureScreen() async -> CGImage? {
-        // SCShareableContent for available displays
-        // For now: use CGWindowListCreateImage for the main display
-        // TODO: ScreenCaptureKit full implementation
+        // CGDisplayCreateImage may crash (SIGBUS) on Intel Macs without
+        // Screen Recording permission. Check access first.
+        guard CGPreflightScreenCaptureAccess() else {
+            fputs("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n", stderr)
+            return nil
+        }
         let displayID = CGMainDisplayID()
         return CGDisplayCreateImage(displayID)
     }
