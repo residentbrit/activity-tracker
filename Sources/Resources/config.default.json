@@ -1,0 +1,29 @@
+{
+  "heartbeatIntervalSec": 30,
+  "typingPauseSec": 3,
+  "idleTimeoutMin": 5,
+  "audioMode": "meetings_only",
+  "meetingBundleIDs": [
+    "com.microsoft.teams",
+    "com.tinyspeck.slackmacgap",
+    "us.zoom.xos"
+  ],
+  "meetingWindowTitlePatterns": [
+    "huddle"
+  ],
+  "screenshotRetentionHours": 24,
+  "dbPath": "~/.local/share/activity-tracker/activity.db",
+  "syncIntervalMin": 30,
+  "syncTarget": {
+    "host": "192.168.1.33",
+    "port": 5433,
+    "database": "phillip_ai",
+    "user": "activity_tracker",
+    "password": ""
+  },
+  "whisperModel": "small",
+  "embeddingModel": "mxbai-embed-large",
+  "embeddingModelPath": "~/.local/share/activity-tracker/models/",
+  "embeddingBinaryPath": "~/.local/bin/llama-embedding",
+  "whisperBinaryPath": "~/.local/bin/whisper-cli"
+}

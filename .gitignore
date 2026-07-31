@@ -1,0 +1,10 @@
+.build/
+Packages/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+.DS_Store
+activity.db
+activity.db-wal
+activity.db-shm
+.build/deps/

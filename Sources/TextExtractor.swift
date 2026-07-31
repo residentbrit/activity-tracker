@@ -1,0 +1,104 @@
+import Foundation
+import Vision
+import Cocoa
+
+/// AX-first, OCR-fallback text extraction (D3).
+/// Accessibility tree is fast, free, resolution-independent.
+/// Vision OCR only fires when AX comes back empty.
+actor TextExtractor {
+
+    struct ExtractionResult {
+        let text: String
+        let source: SourceType
+    }
+
+    enum SourceType: String, Codable {
+        case accessibility
+        case ocr
+    }
+
+    /// Extract text from the current screen context.
+    /// `bundleID` optionally scopes which app to query via AX.
+    func extract(from image: CGImage, bundleID: String?) async -> ExtractionResult {
+        // 1. Try accessibility tree first
+        if let axText = await extractViaAX(bundleID: bundleID), !axText.isEmpty {
+            return ExtractionResult(text: axText, source: .accessibility)
+        }
+
+        // 2. Fall back to OCR
+        if let ocrText = await extractViaOCR(image: image) {
+            return ExtractionResult(text: ocrText, source: .ocr)
+        }
+
+        // Nothing found
+        return ExtractionResult(text: "", source: .accessibility)
+    }
+
+    // MARK: - Accessibility (AXUIElement)
+
+    private func extractViaAX(bundleID: String?) async -> String? {
+        // Get the focused window of the frontmost app
+        let app = NSWorkspace.shared.frontmostApplication
+        let appRef = AXUIElementCreateApplication(app?.processIdentifier ?? 0)
+
+        var focusedWindow: CFTypeRef?
+        let windowResult = AXUIElementCopyAttributeValue(
+            appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow
+        )
+        guard windowResult == .success, let window = focusedWindow else { return nil }
+
+        // Walk the AX tree for all visible text elements
+        return await withCheckedContinuation { continuation in
+            var allText: [String] = []
+            collectAXText(from: window as! AXUIElement, into: &allText)
+            continuation.resume(returning: allText.joined(separator: "\n"))
+        }
+    }
+
+    private func collectAXText(from element: AXUIElement, into result: inout [String]) {
+        // Check for text attributes
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
+           let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result.append(text)
+        }
+
+        // Check for title (window titles, tab labels)
+        var title: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title) == .success,
+           let titleStr = title as? String, !titleStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result.append(titleStr)
+        }
+
+        // Recurse into children
+        var children: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+           let childArray = children as? [AXUIElement] {
+            for child in childArray {
+                collectAXText(from: child, into: &result)
+            }
+        }
+    }
+
+    // MARK: - Vision OCR
+
+    private func extractViaOCR(image: CGImage) async -> String? {
+        return await withCheckedContinuation { continuation in
+            let request = VNRecognizeTextRequest { request, error in
+                guard error == nil,
+                      let observations = request.results as? [VNRecognizedTextObservation] else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let text = observations.compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: "\n")
+                continuation.resume(returning: text)
+            }
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+
+            let handler = VNImageRequestHandler(cgImage: image, options: [:])
+            try? handler.perform([request])
+        }
+    }
+}
