@@ -109,6 +109,12 @@ final class InputMonitor: @unchecked Sendable {
     // MARK: - CGEvent tap (keystroke + click detection)
 
     private func createEventTap() {
+        // CGEvent.tapCreate may SIGBUS without Accessibility permission on
+        // some macOS versions. Check trust first.
+        guard AXIsProcessTrusted() else {
+            fputs("[InputMonitor] ⚠️ Accessibility permission not granted — event tap disabled\n", stderr)
+            return
+        }
         let eventMask: CGEventMask = (
             (1 << CGEventType.keyDown.rawValue) |
             (1 << CGEventType.leftMouseDown.rawValue) |
@@ -234,6 +240,10 @@ final class InputMonitor: @unchecked Sendable {
     // MARK: - Window title polling
 
     private func startWindowTitleTimer() {
+        guard AXIsProcessTrusted() else {
+            fputs("[InputMonitor] ⚠️ Accessibility not granted — window title polling disabled\n", stderr)
+            return
+        }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .default))
         timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
         timer.setEventHandler { [weak self] in

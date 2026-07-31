@@ -383,6 +383,7 @@ actor CaptureEngine {
     }
 
     private func axTextHashForPID(pid: pid_t) -> String? {
+        guard AXIsProcessTrusted() else { return nil }
         let appRef = AXUIElementCreateApplication(pid)
         var focusedWindow: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
