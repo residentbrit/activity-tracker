@@ -75,7 +75,8 @@ $(LLAMA_EMBED): $(LLAMA_SRC)
 		-DLLAMA_BUILD_TESTS=OFF \
 		-DLLAMA_BUILD_SERVER=OFF \
 		-DGGML_METAL=ON \
-		-DLLAMA_CURL=OFF
+		-DLLAMA_CURL=OFF \
+		-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON
 	cd $(LLAMA_SRC) && cmake --build build --target llama-embedding -j$(NPROC)
 	mkdir -p $(dir $(LLAMA_EMBED))
 	cp $(LLAMA_SRC)/build/bin/llama-embedding $(LLAMA_EMBED)
