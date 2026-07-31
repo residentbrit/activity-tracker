@@ -143,7 +143,7 @@ actor EventStore {
                 sqlite3_bind_text(stmt, idx, (text as NSString).utf8String, -1, nil)
             case let data as Data:
                 _ = data.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(stmt, idx, ptr.baseAddress, Int32(data.count), nil)
+                    sqlite3_bind_blob(stmt, idx, ptr.baseAddress, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
                 }
             case let num as Int:
                 sqlite3_bind_int64(stmt, idx, Int64(num))
