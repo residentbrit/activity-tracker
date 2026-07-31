@@ -130,7 +130,13 @@ actor CaptureEngine {
     ) async {
         // Save screenshot blob immediately
         if let pngData = image.pngData() {
-            try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+            do {
+                try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+            } catch {
+                fputs("[CaptureEngine] screenshot save failed: \(error.localizedDescription)\n", stderr)
+            }
+        } else {
+            fputs("[CaptureEngine] pngData nil for event \(eventId)\n", stderr)
         }
 
         // Extract text — AX first, OCR fallback
@@ -176,6 +182,8 @@ actor CaptureEngine {
         let embedding = await embedder.embed(textToEmbed)
 
         let filePath = extractFilePath(from: windowTitle, axText: text)
+
+        fputs("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n", stderr)
 
         try? await eventStore.insertEvent(
             id: eventId, sessionId: sessionId, capturedAt: capturedAt,
