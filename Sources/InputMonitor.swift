@@ -87,10 +87,15 @@ final class InputMonitor: @unchecked Sendable {
     // MARK: - Start / Stop
 
     func start() {
+        fputs("[InputMonitor] creating event tap…\n", stderr)
         createEventTap()
+        fputs("[InputMonitor] event tap done, starting typing timer…\n", stderr)
         startTypingPauseTimer()
+        fputs("[InputMonitor] typing timer done, starting idle timer…\n", stderr)
         startIdlePollTimer()
+        fputs("[InputMonitor] idle timer done, starting window timer…\n", stderr)
         startWindowTitleTimer()
+        fputs("[InputMonitor] all timers running\n", stderr)
     }
 
     func stop() {
