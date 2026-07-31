@@ -86,6 +86,10 @@ $(WHISPER_SRC):
 
 $(WHISPER_CLI): $(WHISPER_SRC)
 	@echo "==> Building whisper.cpp (whisper-cli) …"
+	@# Fix: same errno bug as llama.cpp — they share ggml
+	@if ! grep -q '<cerrno>' $(WHISPER_SRC)/ggml/src/gguf.cpp; then \
+		sed -i '' '1s/^/#include <cerrno>\n/' $(WHISPER_SRC)/ggml/src/gguf.cpp; \
+	fi
 	cd $(WHISPER_SRC) && cmake -B build
 	cd $(WHISPER_SRC) && cmake --build build --target whisper-cli -j$(NPROC)
 	mkdir -p $(dir $(WHISPER_CLI))
