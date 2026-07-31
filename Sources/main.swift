@@ -28,10 +28,22 @@ struct ActivityTracker {
         // Run until SIGTERM/SIGINT
         fputs("[ActivityTracker] entering run loop…\n", stderr)
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { await captureEngine.run() }
-            group.addTask { await mcpServer.run() }
-            group.addTask { await syncEngine.run() }
-            group.addTask { await audioCapture.startPolling() }
+            group.addTask {
+                fputs("[main] capture engine starting…\n", stderr)
+                await captureEngine.run()
+            }
+            group.addTask {
+                fputs("[main] mcp server starting…\n", stderr)
+                await mcpServer.run()
+            }
+            group.addTask {
+                fputs("[main] sync engine starting…\n", stderr)
+                await syncEngine.run()
+            }
+            group.addTask {
+                fputs("[main] audio capture starting…\n", stderr)
+                await audioCapture.startPolling()
+            }
         }
     }
 }
