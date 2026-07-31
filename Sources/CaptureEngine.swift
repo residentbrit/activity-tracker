@@ -50,6 +50,7 @@ actor CaptureEngine {
     func run() async {
         let inputMonitor = InputMonitor(config: config)
         inputMonitor.start()
+        fputs("[CaptureEngine] monitor started, entering event loop…\n", stderr)
 
         heartbeatTask = Task { await runHeartbeat() }
 
@@ -57,6 +58,7 @@ actor CaptureEngine {
         let tier1Task = Task { await runTier1Polling() }
 
         // Main event loop
+        fputs("[CaptureEngine] waiting for first event…\n", stderr)
         for await event in inputMonitor.events {
             if isIdle && event != .appSwitch {
                 continue
@@ -241,6 +243,7 @@ actor CaptureEngine {
     /// Uses text-hash for AX-capable apps, pixel-hash for AX-opaque ones.
     /// Fires a per-window capture only when content has changed.
     private func runTier1Polling() async {
+        fputs("[CaptureEngine] tier1 polling started\n", stderr)
         while !Task.isCancelled {
             if !isIdle {
                 await pollTier1Windows()

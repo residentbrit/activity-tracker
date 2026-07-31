@@ -27,6 +27,7 @@ actor SyncEngine {
     }
 
     func run() async {
+        fputs("[SyncEngine] run loop starting\n", stderr)
         while !Task.isCancelled {
             do { try await performSync() }
             catch { fputs("[SyncEngine] sync failed: \(error.localizedDescription)\n", stderr) }
