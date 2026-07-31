@@ -148,7 +148,11 @@ actor CaptureEngine {
             )
             // Still save screenshot for deduplicated events
             if let pngData = image.pngData() {
-                try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+                do {
+                    try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+                } catch {
+                    fputs("[CaptureEngine] screenshot save failed: \(error)\n", stderr)
+                }
             }
             return
         }
@@ -190,7 +194,11 @@ actor CaptureEngine {
 
         // 6. Save screenshot AFTER event exists
         if let pngData = image.pngData() {
-            try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+            do {
+                try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+            } catch {
+                fputs("[CaptureEngine] screenshot save failed: \(error)\n", stderr)
+            }
         }
     }
 
