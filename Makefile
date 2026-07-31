@@ -79,16 +79,17 @@ $(LLAMA_EMBED): $(LLAMA_SRC)
 	mkdir -p $(dir $(LLAMA_EMBED))
 	cp $(LLAMA_SRC)/build/bin/llama-embedding $(LLAMA_EMBED)
 
-# --- whisper.cpp (plain Makefile) ---
+# --- whisper.cpp (uses cmake — they also dropped the plain Makefile) ---
 
 $(WHISPER_SRC):
 	git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git $(WHISPER_SRC)
 
 $(WHISPER_CLI): $(WHISPER_SRC)
 	@echo "==> Building whisper.cpp (whisper-cli) …"
-	cd $(WHISPER_SRC) && make whisper-cli -j$(NPROC)
+	cd $(WHISPER_SRC) && cmake -B build
+	cd $(WHISPER_SRC) && cmake --build build --target whisper-cli -j$(NPROC)
 	mkdir -p $(dir $(WHISPER_CLI))
-	cp $(WHISPER_SRC)/whisper-cli $(WHISPER_CLI)
+	cp $(WHISPER_SRC)/build/bin/whisper-cli $(WHISPER_CLI)
 
 # --- Models ---
 
