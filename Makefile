@@ -66,6 +66,10 @@ $(LLAMA_SRC):
 
 $(LLAMA_EMBED): $(LLAMA_SRC)
 	@echo "==> Building llama.cpp (llama-embedding) …"
+	@# Fix: missing <cerrno> include on macOS with Apple Clang 16
+	@if ! grep -q '<cerrno>' $(LLAMA_SRC)/ggml/src/gguf.cpp; then \
+		sed -i '' '1s/^/#include <cerrno>\n/' $(LLAMA_SRC)/ggml/src/gguf.cpp; \
+	fi
 	cd $(LLAMA_SRC) && cmake -B build \
 		-DLLAMA_BUILD_EXAMPLES=ON \
 		-DLLAMA_BUILD_TESTS=OFF \
