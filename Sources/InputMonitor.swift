@@ -78,6 +78,15 @@ final class InputMonitor: @unchecked Sendable {
     // MARK: - Start / Stop
 
     func start() {
+        // App-switch notifications — most important capture trigger
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.lastInputTime = Date()
+            self?.continuation.yield(.appSwitch)
+        }
+
         fputs("[InputMonitor] creating event tap…\n", stderr)
         createEventTap()
         fputs("[InputMonitor] event tap done, starting typing timer…\n", stderr)
