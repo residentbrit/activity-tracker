@@ -41,6 +41,7 @@ struct MeetingDetector {
     }
 
     private func hasMeetingWindowTitle() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
         guard let app = NSWorkspace.shared.frontmostApplication else { return false }
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
 
