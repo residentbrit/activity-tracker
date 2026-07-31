@@ -55,27 +55,27 @@ actor TextExtractor {
         }
     }
 
-    private func collectAXText(from element: AXUIElement, into result: inout [String]) {
-        // Check for text attributes
-        var value: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
-           let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            result.append(text)
-        }
+    /// Iterative AX tree walk — avoids stack overflow on GCD threads.
+    private func collectAXText(from root: AXUIElement, into result: inout [String]) {
+        var stack: [AXUIElement] = [root]
 
-        // Check for title (window titles, tab labels)
-        var title: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title) == .success,
-           let titleStr = title as? String, !titleStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            result.append(titleStr)
-        }
+        while let element = stack.popLast() {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
+               let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                result.append(text)
+            }
 
-        // Recurse into children
-        var children: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-           let childArray = children as? [AXUIElement] {
-            for child in childArray {
-                collectAXText(from: child, into: &result)
+            var title: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title) == .success,
+               let titleStr = title as? String, !titleStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                result.append(titleStr)
+            }
+
+            var children: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+               let childArray = children as? [AXUIElement] {
+                stack.append(contentsOf: childArray.reversed())
             }
         }
     }

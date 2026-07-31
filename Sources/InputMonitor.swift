@@ -69,15 +69,6 @@ final class InputMonitor: @unchecked Sendable {
             capturedContinuation = continuation
         }
         self.continuation = capturedContinuation
-
-        // App-switch notifications — set up after all members are initialized
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lastInputTime = Date()
-            self?.continuation.yield(.appSwitch)
-        }
     }
 
     deinit {

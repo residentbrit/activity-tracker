@@ -398,16 +398,23 @@ actor CaptureEngine {
         return combined.isEmpty ? nil : combined.simpleHash()
     }
 
-    private func collectAXText(from element: AXUIElement, into result: inout [String]) {
-        var value: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
-           let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            result.append(text)
-        }
-        var children: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-           let kids = children as? [AXUIElement] {
-            for child in kids { collectAXText(from: child, into: &result) }
+    /// Iterative AX tree walk — no recursion, safe on small GCD stacks.
+    private func collectAXText(from root: AXUIElement, into result: inout [String]) {
+        var stack: [AXUIElement] = [root]
+
+        while let element = stack.popLast() {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
+               let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                result.append(text)
+            }
+
+            var children: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+               let kids = children as? [AXUIElement] {
+                // Push in reverse so first child is processed first
+                stack.append(contentsOf: kids.reversed())
+            }
         }
     }
 
