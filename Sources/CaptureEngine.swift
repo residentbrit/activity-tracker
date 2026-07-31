@@ -60,6 +60,7 @@ actor CaptureEngine {
         // Main event loop
         fputs("[CaptureEngine] waiting for first event…\n", stderr)
         for await event in inputMonitor.events {
+            fputs("[CaptureEngine] received event: \(event)\n", stderr)
             if isIdle && event != .appSwitch {
                 continue
             }
@@ -86,6 +87,8 @@ actor CaptureEngine {
     }
 
     private func capture(trigger: String) async {
+        fputs("[CaptureEngine] capture(\(trigger)) starting\n", stderr)
+
         // Ensure session exists
         if currentSession == nil {
             await startNewSession()
@@ -234,6 +237,7 @@ actor CaptureEngine {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(config.heartbeatIntervalSec))
             if !isIdle {
+                fputs("[CaptureEngine] heartbeat firing\n", stderr)
                 await capture(trigger: "heartbeat")
             }
         }
