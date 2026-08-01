@@ -50,7 +50,7 @@ actor CaptureEngine {
     func run() async {
         let inputMonitor = InputMonitor(config: config)
         inputMonitor.start()
-        fputs("[CaptureEngine] monitor started, entering event loop…\n", stderr)
+        log("[CaptureEngine] monitor started, entering event loop…\n")
 
         heartbeatTask = Task { await runHeartbeat() }
 
@@ -64,9 +64,9 @@ actor CaptureEngine {
         }
 
         // Main event loop
-        fputs("[CaptureEngine] waiting for first event…\n", stderr)
+        log("[CaptureEngine] waiting for first event…\n")
         for await event in inputMonitor.events {
-            fputs("[CaptureEngine] received event: \(event)\n", stderr)
+            log("[CaptureEngine] received event: \(event)\n")
             if isIdle && event != .appSwitch {
                 continue
             }
@@ -93,7 +93,7 @@ actor CaptureEngine {
     }
 
     private func capture(trigger: String) async {
-        fputs("[CaptureEngine] capture(\(trigger)) starting\n", stderr)
+        log("[CaptureEngine] capture(\(trigger)) starting\n")
 
         // Ensure session exists
         if currentSession == nil {
@@ -157,7 +157,7 @@ actor CaptureEngine {
                 do {
                     try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
                 } catch {
-                    fputs("[CaptureEngine] screenshot save failed: \(error)\n", stderr)
+                    log("[CaptureEngine] screenshot save failed: \(error)\n")
                 }
             }
             return
@@ -185,7 +185,7 @@ actor CaptureEngine {
 
         // 4. Save event immediately (embedding is async, don't block the queue)
         let filePath = extractFilePath(from: windowTitle, axText: text)
-        fputs("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n", stderr)
+        log("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n")
 
         try? await eventStore.insertEvent(
             id: eventId, sessionId: sessionId, capturedAt: capturedAt,
@@ -218,7 +218,7 @@ actor CaptureEngine {
         // CGDisplayCreateImage may crash (SIGBUS) on Intel Macs without
         // Screen Recording permission. Check access first.
         guard CGPreflightScreenCaptureAccess() else {
-            fputs("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n", stderr)
+            log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
             return nil
         }
         let displayID = CGMainDisplayID()
@@ -252,7 +252,7 @@ actor CaptureEngine {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(config.heartbeatIntervalSec))
             if !isIdle {
-                fputs("[CaptureEngine] heartbeat firing\n", stderr)
+                log("[CaptureEngine] heartbeat firing\n")
                 await capture(trigger: "heartbeat")
             }
         }
@@ -275,7 +275,7 @@ actor CaptureEngine {
 
     private func pollTier1Windows() async {
         guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-            fputs("[CaptureEngine] tier1: no window list\n", stderr)
+            log("[CaptureEngine] tier1: no window list\n")
             return
         }
 
@@ -316,7 +316,7 @@ actor CaptureEngine {
             captured += 1
         }
         if found > 0 || captured > 0 {
-            fputs("[CaptureEngine] tier1 poll: \(found) windows, \(captured) captures\n", stderr)
+            log("[CaptureEngine] tier1 poll: \(found) windows, \(captured) captures\n")
         }
     }
 

@@ -27,10 +27,10 @@ actor SyncEngine {
     }
 
     func run() async {
-        fputs("[SyncEngine] run loop starting\n", stderr)
+        log("[SyncEngine] run loop starting\n")
         while !Task.isCancelled {
             do { try await performSync() }
-            catch { fputs("[SyncEngine] sync failed: \(error.localizedDescription)\n", stderr) }
+            catch { log("[SyncEngine] sync failed: \(error.localizedDescription)\n") }
             try? await Task.sleep(for: .seconds(config.syncIntervalMin * 60))
         }
     }
@@ -79,7 +79,7 @@ actor SyncEngine {
         try await eventStore.markSynced(eventIDs: syncedIDs)
 
         try await eventStore.updateSyncLog(id: logId, endedAt: nowISO(), eventsSynced: syncedIDs.count, status: "exported")
-        fputs("[SyncEngine] exported \(syncedIDs.count) events → \(filename)\n", stderr)
+        log("[SyncEngine] exported \(syncedIDs.count) events → \(filename)\n")
     }
 
     func status() async -> SyncStatus {

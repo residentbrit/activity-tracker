@@ -70,13 +70,13 @@ actor Embedder {
             let (_, resp) = try await URLSession.shared.data(for: req)
             return (resp as? HTTPURLResponse)?.statusCode == 200
         } catch {
-            fputs("[Embedder] server not running, using subprocess mode\n", stderr)
+            log("[Embedder] server not running, using subprocess mode\n")
             return false
         }
     }
 
     private func drainViaServer(_ batch: [(String, CheckedContinuation<Data?, Never>)]) async {
-        fputs("[Embedder] batching \(batch.count) texts via server\n", stderr)
+        log("[Embedder] batching \(batch.count) texts via server\n")
         for (text, cont) in batch {
             let result = await embedViaServer(text)
             cont.resume(returning: result)
@@ -106,7 +106,7 @@ actor Embedder {
             let floats = embedding.map { Float($0) }
             return floats.withUnsafeBytes { Data($0) }
         } catch {
-            fputs("[Embedder] server request failed: \(error)\n", stderr)
+            log("[Embedder] server request failed: \(error)\n")
             return nil
         }
     }
@@ -114,7 +114,7 @@ actor Embedder {
     // MARK: - Subprocess fallback
 
     private func drainViaSubprocess(_ batch: [(String, CheckedContinuation<Data?, Never>)]) async {
-        fputs("[Embedder] batching \(batch.count) texts via subprocess\n", stderr)
+        log("[Embedder] batching \(batch.count) texts via subprocess\n")
         for (text, cont) in batch {
             let result = await runSubprocess(text)
             cont.resume(returning: result)

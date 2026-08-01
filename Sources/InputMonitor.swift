@@ -87,15 +87,15 @@ final class InputMonitor: @unchecked Sendable {
             self?.continuation.yield(.appSwitch)
         }
 
-        fputs("[InputMonitor] creating event tap…\n", stderr)
+        log("[InputMonitor] creating event tap…\n")
         createEventTap()
-        fputs("[InputMonitor] event tap done, starting typing timer…\n", stderr)
+        log("[InputMonitor] event tap done, starting typing timer…\n")
         startTypingPauseTimer()
-        fputs("[InputMonitor] typing timer done, starting idle timer…\n", stderr)
+        log("[InputMonitor] typing timer done, starting idle timer…\n")
         startIdlePollTimer()
-        fputs("[InputMonitor] idle timer done, starting window timer…\n", stderr)
+        log("[InputMonitor] idle timer done, starting window timer…\n")
         startWindowTitleTimer()
-        fputs("[InputMonitor] all timers running\n", stderr)
+        log("[InputMonitor] all timers running\n")
     }
 
     func stop() {
@@ -112,7 +112,7 @@ final class InputMonitor: @unchecked Sendable {
         // CGEvent.tapCreate may SIGBUS without Accessibility permission on
         // some macOS versions. Check trust first.
         guard AXIsProcessTrusted() else {
-            fputs("[InputMonitor] ⚠️ Accessibility permission not granted — event tap disabled\n", stderr)
+            log("[InputMonitor] ⚠️ Accessibility permission not granted — event tap disabled\n")
             return
         }
         let eventMask: CGEventMask = (
@@ -241,7 +241,7 @@ final class InputMonitor: @unchecked Sendable {
 
     private func startWindowTitleTimer() {
         guard AXIsProcessTrusted() else {
-            fputs("[InputMonitor] ⚠️ Accessibility not granted — window title polling disabled\n", stderr)
+            log("[InputMonitor] ⚠️ Accessibility not granted — window title polling disabled\n")
             return
         }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .default))

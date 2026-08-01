@@ -5,43 +5,43 @@ import Foundation
 @main
 struct ActivityTracker {
     static func main() async throws {
-        fputs("[ActivityTracker] starting up…\n", stderr)
+        log("starting up…")
 
         // 1. Load config
-        fputs("[ActivityTracker] loading config…\n", stderr)
+        log("loading config…")
         let config = try Config.load()
-        fputs("[ActivityTracker] config loaded\n", stderr)
+        log("config loaded")
 
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)
-        fputs("[ActivityTracker] opening database…\n", stderr)
+        log("opening database…")
         let db = try Database(config: config)
-        fputs("[ActivityTracker] database ready\n", stderr)
+        log("database ready")
 
         // 3-6: create subsystems (don't start them yet)
-        fputs("[ActivityTracker] initializing subsystems…\n", stderr)
+        log("initializing subsystems…")
         let captureEngine = CaptureEngine(config: config, database: db)
         let mcpServer = MCPServer(database: db)
         let syncEngine = SyncEngine(config: config, database: db)
         let audioCapture = AudioCapture(config: config, database: db)
-        fputs("[ActivityTracker] subsystems ready\n", stderr)
+        log("subsystems ready")
 
         // Run until SIGTERM/SIGINT
-        fputs("[ActivityTracker] entering run loop…\n", stderr)
+        log("entering run loop…")
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                fputs("[main] capture engine starting…\n", stderr)
+                log("capture engine starting…")
                 await captureEngine.run()
             }
             group.addTask {
-                fputs("[main] mcp server starting…\n", stderr)
+                log("mcp server starting…")
                 await mcpServer.run()
             }
             group.addTask {
-                fputs("[main] sync engine starting…\n", stderr)
+                log("sync engine starting…")
                 await syncEngine.run()
             }
             group.addTask {
-                fputs("[main] audio capture starting…\n", stderr)
+                log("audio capture starting…")
                 await audioCapture.startPolling()
             }
         }

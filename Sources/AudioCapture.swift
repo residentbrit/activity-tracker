@@ -79,7 +79,7 @@ actor AudioCapture {
             try setupAudioEngine()
             try audioEngine?.start()
         } catch {
-            fputs("[AudioCapture] failed to start audio: \(error.localizedDescription)\n", stderr)
+            log("[AudioCapture] failed to start audio: \(error.localizedDescription)\n")
             isInMeeting = false
         }
     }
@@ -92,7 +92,7 @@ actor AudioCapture {
         audioEngine = nil
 
         let endedAt = ISO8601DateFormatter().string(from: Date())
-        fputs("[AudioCapture] meeting ended, \(speechSegments.count) speech segments\n", stderr)
+        log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments\n")
 
         guard !speechSegments.isEmpty else {
             currentMeetingApp = nil
@@ -181,7 +181,7 @@ actor AudioCapture {
     private static func runWhisper(_ audioData: Data, config: Config) -> String? {
         // Check binary availability
         guard FileManager.default.isExecutableFile(atPath: config.whisperBinaryPath) else {
-            fputs("[AudioCapture] ⚠️ whisper-cli not found at \(config.whisperBinaryPath)\n", stderr)
+            log("[AudioCapture] ⚠️ whisper-cli not found at \(config.whisperBinaryPath)\n")
             return nil
         }
 
@@ -189,7 +189,7 @@ actor AudioCapture {
         let tempDir = FileManager.default.temporaryDirectory
         let wavFile = tempDir.appendingPathComponent("whisper-input-\(UUID().uuidString).wav")
         guard writeWAV(audioData, to: wavFile) else {
-            fputs("[AudioCapture] failed to write WAV\n", stderr)
+            log("[AudioCapture] failed to write WAV\n")
             return nil
         }
         defer { try? FileManager.default.removeItem(at: wavFile) }
@@ -214,7 +214,7 @@ actor AudioCapture {
             try process.run()
             process.waitUntilExit()
         } catch {
-            fputs("[AudioCapture] whisper failed: \(error.localizedDescription)\n", stderr)
+            log("[AudioCapture] whisper failed: \(error.localizedDescription)\n")
             return nil
         }
 
