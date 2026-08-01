@@ -23,6 +23,7 @@ actor CaptureEngine {
     private var heartbeatTask: Task<Void, Never>?
     private var lastTypingTime = Date.distantPast
     private var lastCaptureHash: String?
+    private var inputMonitor: InputMonitor?
 
     // Per-app text diffing: keyed by bundleID, stores last capture's text lines
     private var previousTextByApp: [String: Set<String>] = [:]
@@ -48,15 +49,12 @@ actor CaptureEngine {
     }
 
     func run() async {
-        let inputMonitor = InputMonitor(config: config)
-        
-        // Use direct callback — strong capture in Task.detached
-        inputMonitor.onEvent = { event in
-            Task.detached { [weak self] in
-                await self?.handleEvent(event)
-            }
+        let monitor = InputMonitor(config: config)
+        monitor.onEvent = { [weak self] event in
+            Task.detached { await self?.handleEvent(event) }
         }
-        inputMonitor.start()
+        monitor.start()
+        self.inputMonitor = monitor  // keep alive
         log("[CaptureEngine] monitor started\n")
 
         heartbeatTask = Task.detached { [weak self] in
