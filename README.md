@@ -7,11 +7,13 @@ A local, privacy-first macOS daemon that captures what you work on throughout th
 ## Quick start
 
 ```bash
-# Prerequisite (one time)
+# Prerequisites (one time)
 xcode-select --install
+brew install cmake           # needed for llama.cpp build
 
 # Clone and build
-git clone <repo-url> && cd screenrecorder
+git clone https://github.com/residentbrit/activity-tracker.git
+cd activity-tracker
 make install
 ```
 
@@ -100,18 +102,41 @@ Connect any MCP client to the stdio server:
 
 Then ask natural questions like "what did I work on yesterday?" or "summarize last week."
 
+## Watching it work
+
+```bash
+# View recent captures
+sqlite3 ~/.local/share/activity-tracker/activity.db \
+  "SELECT captured_at, trigger, app_name, substr(text_content,1,80) FROM events ORDER BY captured_at DESC LIMIT 10"
+
+# Count screenshots
+ls ~/.local/share/activity-tracker/screenshots/ | wc -l
+
+# Tail the debug log
+tail -f ~/.local/share/activity-tracker/debug.log
+```
+
 ## Configuration
 
 `~/.config/activity-tracker/config.json` (auto-generated on first run):
 
 ```json
 {
-  "heartbeatIntervalSec": 60,
+  "heartbeatIntervalSec": 30,
   "typingPauseSec": 3,
   "idleTimeoutMin": 5,
   "audioMode": "meetings_only",
   "screenshotRetentionHours": 24,
-  "syncIntervalMin": 30
+  "syncIntervalMin": 30,
+  "tier1PollIntervalSec": 5,
+  "tier1BundleIDs": [
+    "com.tinyspeck.slackmacgap",
+    "com.microsoft.VSCode",
+    "com.apple.Terminal",
+    "com.google.Chrome",
+    "io.gitlab.librewolf-community",
+    "com.microsoft.Outlook"
+  ]
 }
 ```
 
@@ -126,11 +151,11 @@ Events are exported as JSON to `~/.local/share/activity-tracker/sync-outbox/`. A
 | Layer | Technology |
 |---|---|
 | Language | Swift 6 |
-| Screen capture | ScreenCaptureKit |
+| Screen capture | ScreenCaptureKit + CGWindowList |
 | Text extraction | AXUIElement + Vision OCR |
 | Audio | AVFoundation + whisper.cpp `small` |
 | Embedding | llama.cpp + mxbai-embed-large (1024-dim) |
-| Local storage | SQLite (WAL mode) |
+| Local storage | SQLite (WAL) + disk screenshots |
 | Query interface | MCP over stdio (JSON-RPC 2.0) |
 | Remote storage | pgvector (homellm, optional) |
 | Summarization | mlx-lm on M4 Pro (homellm, optional) |
