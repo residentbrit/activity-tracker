@@ -78,11 +78,15 @@ final class InputMonitor: @unchecked Sendable {
     // MARK: - Start / Stop
 
     func start() {
+        log("[InputMonitor] start() called")
+
         // App-switch notifications — most important capture trigger
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            log("[InputMonitor] NSWorkspace app-switch: \(app?.localizedName ?? "?")")
             self?.lastInputTime = Date()
             self?.continuation.yield(.appSwitch)
         }
@@ -168,6 +172,7 @@ final class InputMonitor: @unchecked Sendable {
 
     /// Called from CGEvent tap callback thread. Keep it fast — just update timestamps.
     private func handleInputEvent(type: CGEventType) {
+        log("[InputMonitor] CGEvent: \(type.rawValue)")
         let now = Date()
         lastInputTime = now
 
@@ -198,6 +203,7 @@ final class InputMonitor: @unchecked Sendable {
         )
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            log("[InputMonitor] typing pause timer fired")
             let elapsed = Date().timeIntervalSince(self.lastKeystrokeTime)
             if elapsed >= Double(self.config.typingPauseSec) && self.lastKeystrokeTime > Date.distantPast {
                 self.continuation.yield(.typingPause)
@@ -216,16 +222,15 @@ final class InputMonitor: @unchecked Sendable {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
 
-            // CGEventSourceSecondsSinceLastEventType returns seconds since last HID input
             let idleSeconds = CGEventSource.secondsSinceLastEventType(
                 .hidSystemState, eventType: .keyDown
             )
-            // Also check mouse activity
             let mouseIdle = CGEventSource.secondsSinceLastEventType(
                 .hidSystemState, eventType: .leftMouseDown
             )
 
             let effectiveIdle = min(idleSeconds, mouseIdle)
+            log("[InputMonitor] idle poll: \(effectiveIdle)s idle, threshold=\(self.config.idleTimeoutMin * 60)s")
             let idleThreshold = Double(self.config.idleTimeoutMin * 60)
 
             if effectiveIdle >= idleThreshold && !self.isIdle {
@@ -250,8 +255,9 @@ final class InputMonitor: @unchecked Sendable {
             guard let self, !self.isIdle else { return }
 
             let currentTitle = self.getFocusedWindowTitle()
+            log("[InputMonitor] window title poll: '\(currentTitle?.prefix(50) ?? "nil")'")
             if currentTitle != self.lastWindowTitle && self.lastWindowTitle != nil {
-                // Title changed (not first poll) — yield event
+                log("[InputMonitor] window title changed → yielding event")
                 self.continuation.yield(.windowTitleChange)
             }
             self.lastWindowTitle = currentTitle
