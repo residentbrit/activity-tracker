@@ -5,7 +5,6 @@ import Foundation
 @main
 struct ActivityTracker {
     static func main() async throws {
-        log("v2-callback starting up…")
 
         // 1. Load config
         log("loading config…")

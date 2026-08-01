@@ -82,20 +82,15 @@ final class InputMonitor: @unchecked Sendable {
             object: nil, queue: .main
         ) { [weak self] note in
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            log("[InputMonitor] NSWorkspace app-switch: \(app?.localizedName ?? "?")")
             self?.lastInputTime = Date()
             self?.onEvent?(.appSwitch)
         }
 
         log("[InputMonitor] creating event tap…\n")
         createEventTap()
-        log("[InputMonitor] event tap done, starting typing timer…\n")
         startTypingPauseTimer()
-        log("[InputMonitor] typing timer done, starting idle timer…\n")
         startIdlePollTimer()
-        log("[InputMonitor] idle timer done, starting window timer…\n")
         startWindowTitleTimer()
-        log("[InputMonitor] all timers running\n")
     }
 
     func stop() {
@@ -168,7 +163,6 @@ final class InputMonitor: @unchecked Sendable {
 
     /// Called from CGEvent tap callback thread. Keep it fast — just update timestamps.
     private func handleInputEvent(type: CGEventType) {
-        log("[InputMonitor] CGEvent: \(type.rawValue)")
         let now = Date()
         lastInputTime = now
 
@@ -199,7 +193,6 @@ final class InputMonitor: @unchecked Sendable {
         )
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            log("[InputMonitor] typing pause timer fired")
             let elapsed = Date().timeIntervalSince(self.lastKeystrokeTime)
             if elapsed >= Double(self.config.typingPauseSec) && self.lastKeystrokeTime > Date.distantPast {
                 self.onEvent?(.typingPause)
@@ -226,7 +219,6 @@ final class InputMonitor: @unchecked Sendable {
             )
 
             let effectiveIdle = min(idleSeconds, mouseIdle)
-            log("[InputMonitor] idle poll: \(effectiveIdle)s idle, threshold=\(self.config.idleTimeoutMin * 60)s")
             let idleThreshold = Double(self.config.idleTimeoutMin * 60)
 
             if effectiveIdle >= idleThreshold && !self.isIdle {
@@ -242,7 +234,6 @@ final class InputMonitor: @unchecked Sendable {
 
     private func startWindowTitleTimer() {
         guard AXIsProcessTrusted() else {
-            log("[InputMonitor] ⚠️ Accessibility not granted — window title polling disabled\n")
             return
         }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .default))
@@ -251,9 +242,7 @@ final class InputMonitor: @unchecked Sendable {
             guard let self, !self.isIdle else { return }
 
             let currentTitle = self.getFocusedWindowTitle()
-            log("[InputMonitor] window title poll: '\(currentTitle?.prefix(50) ?? "nil")'")
             if currentTitle != self.lastWindowTitle && self.lastWindowTitle != nil {
-                log("[InputMonitor] window title changed → yielding event")
                 self.onEvent?(.windowTitleChange)
             }
             self.lastWindowTitle = currentTitle
