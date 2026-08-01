@@ -49,13 +49,15 @@ actor CaptureEngine {
 
     func run() async {
         let inputMonitor = InputMonitor(config: config)
+        
+        // Use direct callback instead of AsyncStream (avoiding actor deadlock)
+        inputMonitor.onEvent = { [weak self] event in
+            Task { await self?.handleEvent(event) }
+        }
         inputMonitor.start()
-        log("[CaptureEngine] monitor started, entering event loop…\n")
+        log("[CaptureEngine] monitor started\n")
 
         heartbeatTask = Task { await runHeartbeat() }
-
-        // Start tier 1 per-window polling (faster cadence for key apps)
-        // Detached — runs independently so AX walks don't block the event loop
         let tier1Task = Task.detached { [config, weak self] in
             while !Task.isCancelled {
                 await self?.runTier1PollingCycle()
@@ -63,33 +65,28 @@ actor CaptureEngine {
             }
         }
 
-        // Main event loop
-        log("[CaptureEngine] waiting for first event…\n")
-        for await event in inputMonitor.events {
-            log("[CaptureEngine] received event: \(event)\n")
-            if isIdle && event != .appSwitch {
-                continue
-            }
-
-            switch event {
-            case .appSwitch:
-                await capture(trigger: "app_switch")
-                isIdle = false
-                resetIdleTimer()
-
-            case .windowTitleChange:
-                await capture(trigger: "window_title_change")
-
-            case .typingPause:
-                await capture(trigger: "typing_pause")
-
-            case .idleTimeout:
-                isIdle = true
-                await closeCurrentSession()
-            }
+        // Keep alive until cancelled
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1))
         }
-
         tier1Task.cancel()
+    }
+
+    private func handleEvent(_ event: InputMonitor.Event) async {
+        log("[CaptureEngine] received event: \(event)\n")
+        if isIdle && event != .appSwitch { return }
+        switch event {
+        case .appSwitch:
+            await capture(trigger: "app_switch")
+            isIdle = false
+        case .windowTitleChange:
+            await capture(trigger: "window_title_change")
+        case .typingPause:
+            await capture(trigger: "typing_pause")
+        case .idleTimeout:
+            isIdle = true
+            await closeCurrentSession()
+        }
     }
 
     private func capture(trigger: String) async {

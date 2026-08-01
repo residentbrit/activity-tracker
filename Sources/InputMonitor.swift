@@ -22,8 +22,10 @@ final class InputMonitor: @unchecked Sendable {
         case idleTimeout
     }
 
-    let events: AsyncStream<Event>
-    private let continuation: AsyncStream<Event>.Continuation
+    /// Direct callback — called on an arbitrary thread when an event fires.
+    /// Set by CaptureEngine before start().
+    var onEvent: ((Event) -> Void)?
+
     private let config: Config
 
     // MARK: - Mutable state (NSLock protected — CGEvent tap fires on arbitrary thread)
@@ -63,12 +65,6 @@ final class InputMonitor: @unchecked Sendable {
 
     init(config: Config) {
         self.config = config
-
-        var capturedContinuation: AsyncStream<Event>.Continuation!
-        self.events = AsyncStream { continuation in
-            capturedContinuation = continuation
-        }
-        self.continuation = capturedContinuation
     }
 
     deinit {
@@ -88,7 +84,7 @@ final class InputMonitor: @unchecked Sendable {
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             log("[InputMonitor] NSWorkspace app-switch: \(app?.localizedName ?? "?")")
             self?.lastInputTime = Date()
-            self?.continuation.yield(.appSwitch)
+            self?.onEvent?(.appSwitch)
         }
 
         log("[InputMonitor] creating event tap…\n")
@@ -107,7 +103,7 @@ final class InputMonitor: @unchecked Sendable {
         typingPauseTimer?.cancel()
         idlePollTimer?.cancel()
         windowTitleTimer?.cancel()
-        continuation.finish()
+        // no-op
     }
 
     // MARK: - CGEvent tap (keystroke + click detection)
@@ -206,7 +202,7 @@ final class InputMonitor: @unchecked Sendable {
             log("[InputMonitor] typing pause timer fired")
             let elapsed = Date().timeIntervalSince(self.lastKeystrokeTime)
             if elapsed >= Double(self.config.typingPauseSec) && self.lastKeystrokeTime > Date.distantPast {
-                self.continuation.yield(.typingPause)
+                self.onEvent?(.typingPause)
             }
         }
         timer.resume()
@@ -235,7 +231,7 @@ final class InputMonitor: @unchecked Sendable {
 
             if effectiveIdle >= idleThreshold && !self.isIdle {
                 self.isIdle = true
-                self.continuation.yield(.idleTimeout)
+                self.onEvent?(.idleTimeout)
             }
         }
         timer.resume()
@@ -258,7 +254,7 @@ final class InputMonitor: @unchecked Sendable {
             log("[InputMonitor] window title poll: '\(currentTitle?.prefix(50) ?? "nil")'")
             if currentTitle != self.lastWindowTitle && self.lastWindowTitle != nil {
                 log("[InputMonitor] window title changed → yielding event")
-                self.continuation.yield(.windowTitleChange)
+                self.onEvent?(.windowTitleChange)
             }
             self.lastWindowTitle = currentTitle
         }
