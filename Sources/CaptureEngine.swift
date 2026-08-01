@@ -65,7 +65,7 @@ actor CaptureEngine {
                 await self?.fireHeartbeat()
             }
         }
-        let tier1Task = Task.detached { [config, weak self] in
+        _ = Task.detached { [config, weak self] in
             while !Task.isCancelled {
                 await self?.runTier1PollingCycle()
                 try? await Task.sleep(for: .seconds(config.tier1PollIntervalSec))
@@ -73,7 +73,6 @@ actor CaptureEngine {
         }
 
         // run() returns — tasks keep running in background
-        // The task group in main.swift keeps us alive
     }
 
     private func fireHeartbeat() async {
