@@ -50,8 +50,9 @@ actor CaptureEngine {
     func run() async {
         let inputMonitor = InputMonitor(config: config)
         
-        // Use direct callback instead of AsyncStream (avoiding actor deadlock)
+        // Use direct callback instead of AsyncStream
         inputMonitor.onEvent = { [weak self] event in
+            log("[CaptureEngine] callback fired: \(event)\n")
             Task { await self?.handleEvent(event) }
         }
         inputMonitor.start()
