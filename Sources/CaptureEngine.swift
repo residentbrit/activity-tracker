@@ -51,6 +51,7 @@ actor CaptureEngine {
     func run() async {
         let monitor = InputMonitor(config: config)
         monitor.onEvent = { [weak self] event in
+            log("[CaptureEngine] >>> onEvent closure executing: \(event)\n")
             Task.detached { await self?.handleEvent(event) }
         }
         monitor.start()
