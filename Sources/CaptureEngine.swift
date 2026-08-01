@@ -5,7 +5,7 @@ import Cocoa
 /// Manages screen capture lifecycle. Event-driven + heartbeat (D2).
 /// Capture runs at native resolution. Writes screenshot to DB immediately,
 /// then hands off extraction to a low-priority background queue.
-actor CaptureEngine {
+final class CaptureEngine: @unchecked Sendable {
     private let config: Config
     private let db: Database
     private let eventStore: EventStore
@@ -51,7 +51,10 @@ actor CaptureEngine {
     func run() async {
         let monitor = InputMonitor(config: config)
         monitor.onEvent = { [self] event in
-            Task { await handleEvent(event) }
+            let e = event
+            DispatchQueue.global(qos: .default).async {
+                Task { await self.handleEvent(e) }
+            }
         }
         monitor.start()
         self.inputMonitor = monitor  // keep alive
