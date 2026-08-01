@@ -177,27 +177,31 @@ actor CaptureEngine {
         }
         previousTextByApp[appKey] = newLines
 
-        // 4. Embed
-        let embedding = await embedder.embed(textToEmbed)
+        // 4. Save event immediately (embedding is async, don't block the queue)
         let filePath = extractFilePath(from: windowTitle, axText: text)
-
         fputs("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n", stderr)
 
-        // 5. Insert event FIRST (screenshots table has FK to events)
         try? await eventStore.insertEvent(
             id: eventId, sessionId: sessionId, capturedAt: capturedAt,
             trigger: trigger, appBundleID: bundleID, appName: appName,
             windowTitle: windowTitle, activeFilePath: filePath,
             sourceType: sourceType, textContent: text,
-            embedding: embedding, dedupKey: dedupKey, isDuplicate: false
+            embedding: nil, dedupKey: dedupKey, isDuplicate: false
         )
 
-        // 6. Save screenshot AFTER event exists
+        // 5. Save screenshot AFTER event exists
         if let pngData = image.pngData() {
-            do {
-                try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
-            } catch {
-                fputs("[CaptureEngine] screenshot save failed: \(error)\n", stderr)
+            try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
+        }
+
+        // 6. Embed asynchronously on a low-priority queue — never blocks capture
+        let textToEmbedCopy = textToEmbed
+        extractionQueue.async { [self] in
+            Task {
+                let emb = await embedder.embed(textToEmbedCopy)
+                if let emb {
+                    try? await eventStore.updateEmbedding(eventId: eventId, embedding: emb)
+                }
             }
         }
     }

@@ -73,6 +73,12 @@ actor EventStore {
         try execute(sql, params: eventIDs)
     }
 
+    /// Update embedding for an event after async embedding completes.
+    func updateEmbedding(eventId: String, embedding: Data) throws {
+        let sql = "UPDATE events SET embedding = ? WHERE id = ?"
+        try execute(sql, params: [embedding, eventId])
+    }
+
     // MARK: - Screenshots
 
     func saveScreenshot(eventId: String, imageData: Data) throws {
