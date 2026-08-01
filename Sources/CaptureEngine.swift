@@ -55,7 +55,13 @@ actor CaptureEngine {
         heartbeatTask = Task { await runHeartbeat() }
 
         // Start tier 1 per-window polling (faster cadence for key apps)
-        let tier1Task = Task { await runTier1Polling() }
+        // Detached — runs independently so AX walks don't block the event loop
+        let tier1Task = Task.detached { [config, weak self] in
+            while !Task.isCancelled {
+                await self?.runTier1PollingCycle()
+                try? await Task.sleep(for: .seconds(config.tier1PollIntervalSec))
+            }
+        }
 
         // Main event loop
         fputs("[CaptureEngine] waiting for first event…\n", stderr)
@@ -260,33 +266,31 @@ actor CaptureEngine {
 
     // MARK: - Tier 1 per-window polling
 
-    /// Polls visible windows of tier 1 apps every `tier1PollIntervalSec`.
-    /// Uses text-hash for AX-capable apps, pixel-hash for AX-opaque ones.
-    /// Fires a per-window capture only when content has changed.
-    private func runTier1Polling() async {
-        fputs("[CaptureEngine] tier1 polling started\n", stderr)
-        while !Task.isCancelled {
-            if !isIdle {
-                await pollTier1Windows()
-            }
-            try? await Task.sleep(for: .seconds(config.tier1PollIntervalSec))
+    /// Single cycle of tier 1 polling — called from detached task.
+    private func runTier1PollingCycle() async {
+        if !isIdle {
+            await pollTier1Windows()
         }
     }
 
     private func pollTier1Windows() async {
         guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            fputs("[CaptureEngine] tier1: no window list\n", stderr)
             return
         }
 
         let tier1Set = Set(config.tier1BundleIDs)
+        var found = 0
+        var captured = 0
 
         for windowInfo in windowList {
             guard let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
                   let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID,
-                  let bundleID = bundleIDForPID(pid),
-                  tier1Set.contains(bundleID) else {
+                  let bundleID = bundleIDForPID(pid) else {
                 continue
             }
+            guard tier1Set.contains(bundleID) else { continue }
+            found += 1
 
             // Skip tiny/occluded windows
             let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat] ?? [:]
@@ -309,6 +313,10 @@ actor CaptureEngine {
                 appName: appName,
                 windowTitle: windowTitle ?? windowTitleViaAX(pid: pid)
             )
+            captured += 1
+        }
+        if found > 0 || captured > 0 {
+            fputs("[CaptureEngine] tier1 poll: \(found) windows, \(captured) captures\n", stderr)
         }
     }
 
