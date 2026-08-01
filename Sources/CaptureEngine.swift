@@ -50,9 +50,8 @@ actor CaptureEngine {
 
     func run() async {
         let monitor = InputMonitor(config: config)
-        monitor.onEvent = { [weak self] event in
-            log("[CaptureEngine] >>> closure, self is \(self != nil ? "alive" : "DEAD")\n")
-            Task.detached { await self?.handleEvent(event) }
+        monitor.onEvent = { [self] event in
+            Task { await handleEvent(event) }
         }
         monitor.start()
         self.inputMonitor = monitor  // keep alive
