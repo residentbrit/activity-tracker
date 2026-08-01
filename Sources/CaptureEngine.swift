@@ -50,15 +50,21 @@ actor CaptureEngine {
     func run() async {
         let inputMonitor = InputMonitor(config: config)
         
-        // Use direct callback instead of AsyncStream
-        inputMonitor.onEvent = { [weak self] event in
-            log("[CaptureEngine] callback fired: \(event)\n")
-            Task { await self?.handleEvent(event) }
+        // Use direct callback — strong capture in Task.detached
+        inputMonitor.onEvent = { event in
+            Task.detached { [weak self] in
+                await self?.handleEvent(event)
+            }
         }
         inputMonitor.start()
         log("[CaptureEngine] monitor started\n")
 
-        heartbeatTask = Task { await runHeartbeat() }
+        heartbeatTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Config().heartbeatIntervalSec))
+                await self?.fireHeartbeat()
+            }
+        }
         let tier1Task = Task.detached { [config, weak self] in
             while !Task.isCancelled {
                 await self?.runTier1PollingCycle()
@@ -66,11 +72,15 @@ actor CaptureEngine {
             }
         }
 
-        // Keep alive until cancelled
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(1))
+        // run() returns — tasks keep running in background
+        // The task group in main.swift keeps us alive
+    }
+
+    private func fireHeartbeat() async {
+        if !isIdle {
+            log("[CaptureEngine] heartbeat firing\n")
+            await capture(trigger: "heartbeat")
         }
-        tier1Task.cancel()
     }
 
     private func handleEvent(_ event: InputMonitor.Event) async {
