@@ -80,8 +80,7 @@ final class InputMonitor: @unchecked Sendable {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil, queue: .main
-        ) { [weak self] note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        ) { [weak self] _ in
             self?.lastInputTime = Date()
             self?.onEvent?(.appSwitch)
         }
