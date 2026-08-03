@@ -11,10 +11,30 @@ actor Embedder {
     private let config: Config
     private var useServer: Bool?
     private let serverURL = "http://127.0.0.1:8080"
+    private let maxEmbeddingChars = 1500
+    private let maxEmbeddingWords = 200
 
     // Batch accumulator: texts waiting for the next drain cycle
     private var pending: [(text: String, continuation: CheckedContinuation<Data?, Never>)] = []
     private var drainTask: Task<Void, Never>?
+
+    private final class DataSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            data.append(chunk)
+            lock.unlock()
+        }
+
+        func snapshot() -> Data {
+            lock.lock()
+            let copy = data
+            lock.unlock()
+            return copy
+        }
+    }
 
     init(config: Config) {
         self.config = config
@@ -25,10 +45,22 @@ actor Embedder {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
+        let prepared = prepareEmbeddingInput(trimmed)
+        if prepared.count < trimmed.count {
+            log("[Embedder] truncated input from \(trimmed.count) to \(prepared.count) chars\n")
+        }
+
         return await withCheckedContinuation { cont in
-            pending.append((trimmed, cont))
+            pending.append((prepared, cont))
             scheduleDrain()
         }
+    }
+
+    private func prepareEmbeddingInput(_ text: String) -> String {
+        let charLimited = String(text.prefix(maxEmbeddingChars))
+        let words = charLimited.split(whereSeparator: \.isWhitespace)
+        if words.count <= maxEmbeddingWords { return charLimited }
+        return words.prefix(maxEmbeddingWords).joined(separator: " ")
     }
 
     // MARK: - Batching
@@ -131,7 +163,24 @@ actor Embedder {
     }
 
     private static nonisolated func runEmbeddingSync(_ text: String, config: Config) -> Data? {
-        guard FileManager.default.isExecutableFile(atPath: config.embeddingBinaryPath) else { return nil }
+        guard FileManager.default.isExecutableFile(atPath: config.embeddingBinaryPath) else {
+            fputs("[Embedder] embedding binary not executable at \(config.embeddingBinaryPath)\n", stderr)
+            return nil
+        }
+
+        let modelFile: String = {
+            if config.embeddingModelPath.hasSuffix(".gguf") {
+                return config.embeddingModelPath
+            }
+            if config.embeddingModel.hasSuffix(".gguf") {
+                return (config.embeddingModelPath as NSString).appendingPathComponent(config.embeddingModel)
+            }
+            return (config.embeddingModelPath as NSString).appendingPathComponent("\(config.embeddingModel).gguf")
+        }()
+        guard FileManager.default.fileExists(atPath: modelFile) else {
+            fputs("[Embedder] embedding model not found at \(modelFile)\n", stderr)
+            return nil
+        }
 
         let tempDir = FileManager.default.temporaryDirectory
         let inputFile = tempDir.appendingPathComponent("embed-\(UUID().uuidString).txt")
@@ -141,28 +190,98 @@ actor Embedder {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: config.embeddingBinaryPath)
         process.arguments = [
-            "-m", config.embeddingModelPath + "/mxbai-embed-large.gguf",
+            "-m", modelFile,
             "--pooling", "mean", "--embd-normalize", "2",
             "-f", inputFile.path, "--no-escape",
         ]
         let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
-        process.standardError = Pipe()
+        process.standardError = stderrPipe
 
-        try? process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0,
-              let outputStr = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else {
+        do {
+            try process.run()
+        } catch {
+            fputs("[Embedder] failed to launch subprocess: \(error)\n", stderr)
             return nil
         }
-        return parseOutput(outputStr)
+        let stdoutSink = DataSink()
+        let stderrSink = DataSink()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            stdoutSink.append(data)
+        }
+
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            stderrSink.append(data)
+        }
+
+        process.waitUntilExit()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        stdoutSink.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
+        stderrSink.append(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+        let stdoutData = stdoutSink.snapshot()
+        let stderrData = stderrSink.snapshot()
+
+        let stdoutStr = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrStr = String(data: stderrData, encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            let errPreview = stderrStr.prefix(300)
+            fputs("[Embedder] subprocess exited \(process.terminationStatus). stderr: \(errPreview)\n", stderr)
+            return nil
+        }
+
+        if let parsed = parseOutput(stdoutStr) {
+            return parsed
+        }
+        if let parsed = parseOutput(stderrStr) {
+            return parsed
+        }
+
+        let errPreview = stderrStr.prefix(200)
+        let outPreview = stdoutStr.prefix(200)
+        fputs("[Embedder] failed to parse embedding output. stdout: \(outPreview) stderr: \(errPreview)\n", stderr)
+        return nil
     }
 
     private static nonisolated func parseOutput(_ output: String) -> Data? {
-        let components = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: " ").compactMap { Float($0) }
-        guard components.count == 1024 else { return nil }
-        return components.withUnsafeBytes { Data($0) }
+        let lines = output.split(whereSeparator: \.isNewline)
+        for lineSub in lines {
+            let line = String(lineSub)
+            guard line.contains("embedding") else { continue }
+            let payload: String
+            if let colonIdx = line.firstIndex(of: ":") {
+                payload = String(line[line.index(after: colonIdx)...])
+            } else {
+                payload = line
+            }
+
+            let floats = payload
+                .split(whereSeparator: \.isWhitespace)
+                .compactMap { Float($0) }
+            if floats.count == 1024 {
+                return floats.withUnsafeBytes { Data($0) }
+            }
+            if floats.count > 1024 {
+                let tail = Array(floats.suffix(1024))
+                return tail.withUnsafeBytes { Data($0) }
+            }
+        }
+
+        return nil
     }
 }

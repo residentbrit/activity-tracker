@@ -1,4 +1,7 @@
 import Foundation
+import Darwin
+
+private var retainedSignalSources: [DispatchSourceSignal] = []
 
 /// Entry point. Sets up signal handlers, loads config, starts the capture daemon.
 /// Runs as a background agent — no GUI, no dock icon.
@@ -8,12 +11,27 @@ struct ActivityTracker {
 
         // 1. Load config
         log("loading config…")
-        let config = try Config.load()
+        var config: Config
+        do {
+            config = try Config.load()
+        } catch {
+            log("config load failed, using defaults: \(error)")
+            config = Config()
+        }
         log("config loaded")
 
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)
         log("opening database…")
-        let db = try Database(config: config)
+        let db: Database
+        do {
+            db = try Database(config: config)
+        } catch {
+            let fallbackDir = "\(FileManager.default.currentDirectoryPath)/.activity-tracker/.local/share/activity-tracker"
+            try? FileManager.default.createDirectory(atPath: fallbackDir, withIntermediateDirectories: true)
+            config.dbPath = "\(fallbackDir)/activity.db"
+            log("database open failed at configured path; retrying with fallback path: \(config.dbPath)")
+            db = try Database(config: config)
+        }
         log("database ready")
 
         // 3-6: create subsystems (don't start them yet)
@@ -23,6 +41,25 @@ struct ActivityTracker {
         let syncEngine = SyncEngine(config: config, database: db)
         let audioCapture = AudioCapture(config: config, database: db)
         log("subsystems ready")
+
+        signal(SIGHUP, SIG_IGN)
+        let reloadQueue = DispatchQueue(label: "activity-tracker.reload")
+        let sighupSource = DispatchSource.makeSignalSource(signal: SIGHUP, queue: reloadQueue)
+        sighupSource.setEventHandler {
+            Task {
+                do {
+                    let newConfig = try Config.load()
+                    await captureEngine.applyConfig(newConfig)
+                    await syncEngine.applyConfig(newConfig)
+                    await audioCapture.applyConfig(newConfig)
+                    log("reloaded config via SIGHUP")
+                } catch {
+                    log("config reload failed: \(error)")
+                }
+            }
+        }
+        sighupSource.resume()
+        retainedSignalSources.append(sighupSource)
 
         // Run until SIGTERM/SIGINT
         log("entering run loop…")

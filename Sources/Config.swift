@@ -3,6 +3,7 @@ import Foundation
 /// Loaded from ~/.config/activity-tracker/config.json at startup.
 /// Reloadable on SIGHUP without restart.
 struct Config: Codable {
+    private static let runtimeHome = resolveRuntimeHome()
     // MARK: Capture
     var heartbeatIntervalSec: Int = 30
     var typingPauseSec: Int = 3
@@ -41,7 +42,7 @@ struct Config: Codable {
 
     // MARK: Storage
     var screenshotRetentionHours: Int = 24
-    var dbPath: String = "\(NSHomeDirectory())/.local/share/activity-tracker/activity.db"
+    var dbPath: String = "\(Config.runtimeHome)/.local/share/activity-tracker/activity.db"
 
     // MARK: Sync (D13)
     var syncIntervalMin: Int = 30
@@ -63,26 +64,30 @@ struct Config: Codable {
     }
 
     var embeddingModel: String = "mxbai-embed-large"
-    var embeddingModelPath: String = "\(NSHomeDirectory())/.local/share/activity-tracker/models/"
+    var embeddingModelPath: String = "\(Config.runtimeHome)/.local/share/activity-tracker/models/"
 
     /// Path to llama.cpp's llama-embedding binary.
     /// Build from: https://github.com/ggerganov/llama.cpp
-    var embeddingBinaryPath: String = "\(NSHomeDirectory())/.local/bin/llama-embedding"
+    var embeddingBinaryPath: String = "\(Config.runtimeHome)/.local/bin/llama-embedding"
 
     /// Path to whisper.cpp's whisper-cli binary.
     /// Build from: https://github.com/ggerganov/whisper.cpp
-    var whisperBinaryPath: String = "\(NSHomeDirectory())/.local/bin/whisper-cli"
+    var whisperBinaryPath: String = "\(Config.runtimeHome)/.local/bin/whisper-cli"
 
     // MARK: Loading
 
-    static let configPath = "\(NSHomeDirectory())/.config/activity-tracker/config.json"
+    static let configPath = "\(runtimeHome)/.config/activity-tracker/config.json"
 
     static func load() throws -> Config {
         let url = URL(fileURLWithPath: configPath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             // Return defaults, write template
             let defaults = Config()
-            try defaults.write()
+            do {
+                try defaults.write()
+            } catch {
+                fputs("[Config] warning: could not write default config at \(url.path): \(error)\n", stderr)
+            }
             return defaults
         }
         let data = try Data(contentsOf: url)
@@ -99,5 +104,31 @@ struct Config: Codable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
         try data.write(to: url)
+    }
+
+    private static func resolveRuntimeHome() -> String {
+        if let override = ProcessInfo.processInfo.environment["ACTIVITY_TRACKER_HOME"], !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
+        }
+
+        let home = NSHomeDirectory()
+        let testDir = "\(home)/.local/share/activity-tracker"
+        if canCreate(directory: testDir) {
+            return home
+        }
+
+        let cwdFallback = "\(FileManager.default.currentDirectoryPath)/.activity-tracker"
+        _ = canCreate(directory: "\(cwdFallback)/.local/share/activity-tracker")
+        _ = canCreate(directory: "\(cwdFallback)/.config/activity-tracker")
+        return cwdFallback
+    }
+
+    private static func canCreate(directory path: String) -> Bool {
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            return true
+        } catch {
+            return false
+        }
     }
 }

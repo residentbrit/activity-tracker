@@ -19,7 +19,7 @@ func log(_ msg: String) {
     let data = line.data(using: .utf8)
     logQueue.async {
         guard let data else { return }
-        try? logFile?.seekToEnd()
+        _ = try? logFile?.seekToEnd()
         try? logFile?.write(contentsOf: data)
     }
 }

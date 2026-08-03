@@ -5,8 +5,8 @@ import Cocoa
 /// Manages screen capture lifecycle. Event-driven + heartbeat (D2).
 /// Capture runs at native resolution. Writes screenshot to DB immediately,
 /// then hands off extraction to a low-priority background queue.
-final class CaptureEngine: @unchecked Sendable {
-    private let config: Config
+actor CaptureEngine {
+    private var config: Config
     private let db: Database
     private let eventStore: EventStore
     private let extractor: TextExtractor
@@ -21,6 +21,8 @@ final class CaptureEngine: @unchecked Sendable {
     private var currentSession: Session?
     private var isIdle = false
     private var heartbeatTask: Task<Void, Never>?
+    private var tier1Task: Task<Void, Never>?
+    private var retentionTask: Task<Void, Never>?
     private var lastTypingTime = Date.distantPast
     private var lastCaptureHash: String?
     private var inputMonitor: InputMonitor?
@@ -48,32 +50,65 @@ final class CaptureEngine: @unchecked Sendable {
         self.embedder = Embedder(config: config)
     }
 
+    func applyConfig(_ newConfig: Config) {
+        config = newConfig
+        restartTimers()
+    }
+
     func run() async {
         let monitor = InputMonitor(config: config)
-        monitor.onEvent = { [self] event in
-            let e = event
-            DispatchQueue.global(qos: .default).async {
-                Task { await self.handleEvent(e) }
-            }
+        monitor.onEvent = { [weak self] event in
+            guard let self else { return }
+            Task { await self.handleEvent(event) }
         }
         monitor.start()
         self.inputMonitor = monitor  // keep alive
         log("[CaptureEngine] monitor started\n")
 
+        startTimers()
+
+        // run() returns — tasks keep running in background
+    }
+
+    private func startTimers() {
+        heartbeatTask?.cancel()
+        tier1Task?.cancel()
+        retentionTask?.cancel()
+
         heartbeatTask = Task.detached { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(Config().heartbeatIntervalSec))
-                await self?.fireHeartbeat()
-            }
-        }
-        _ = Task.detached { [config, weak self] in
-            while !Task.isCancelled {
-                await self?.runTier1PollingCycle()
-                try? await Task.sleep(for: .seconds(config.tier1PollIntervalSec))
+                guard let self else { return }
+                let heartbeatIntervalSec = max(5, await self.config.heartbeatIntervalSec)
+                try? await Task.sleep(for: .seconds(heartbeatIntervalSec))
+                await self.fireHeartbeat()
             }
         }
 
-        // run() returns — tasks keep running in background
+        tier1Task = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.runTier1PollingCycle()
+                let pollInterval = max(1, await self.config.tier1PollIntervalSec)
+                try? await Task.sleep(for: .seconds(pollInterval))
+            }
+        }
+
+        retentionTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let retentionHours = max(1, await self.config.screenshotRetentionHours)
+                do {
+                    try await self.eventStore.purgeOldScreenshots(retentionHours: retentionHours)
+                } catch {
+                    log("[CaptureEngine] screenshot purge failed: \(error)")
+                }
+                try? await Task.sleep(for: .seconds(3600))
+            }
+        }
+    }
+
+    private func restartTimers() {
+        startTimers()
     }
 
     private func fireHeartbeat() async {
@@ -329,18 +364,11 @@ final class CaptureEngine: @unchecked Sendable {
     }
 
     /// Returns true if the window's content has changed since last poll.
-    /// AX-capable: walks AX tree → hashes text. AX-opaque: captures thumbnail → hashes pixels.
+    /// Uses lightweight thumbnail pixel hashing to avoid expensive AX-tree walks
+    /// that can starve the actor and block normal capture triggers.
     private func windowContentChanged(windowID: CGWindowID, bundleID: String, pid: pid_t) async -> Bool {
-        let isOpaque = axOpaqueBundleIDs.contains(bundleID)
-
-        let newHash: String?
-        if isOpaque {
-            // Pixel-diff: capture tiny thumbnail, hash it
-            newHash = pixelHashForWindow(windowID: windowID)
-        } else {
-            // Text-diff: walk AX tree, hash the text
-            newHash = axTextHashForPID(pid: pid)
-        }
+        // Pixel-diff: capture tiny thumbnail, hash it
+        let newHash = pixelHashForWindow(windowID: windowID)
 
         guard let hash = newHash else { return false }
 

@@ -11,7 +11,7 @@ import Foundation
 ///       a suitable Swift Postgres client is available or libpq headers
 ///       are accessible.
 actor SyncEngine {
-    private let config: Config
+    private var config: Config
     private let db: Database
     private let eventStore: EventStore
 
@@ -23,7 +23,12 @@ actor SyncEngine {
         self.config = config
         self.db = database
         self.eventStore = EventStore(database: database)
-        self.exportDir = "\(NSHomeDirectory())/.local/share/activity-tracker/sync-outbox"
+        let baseDir = (config.dbPath as NSString).deletingLastPathComponent
+        self.exportDir = "\(baseDir)/sync-outbox"
+    }
+
+    func applyConfig(_ newConfig: Config) {
+        config = newConfig
     }
 
     func run() async {

@@ -37,9 +37,17 @@ actor TextExtractor {
     // MARK: - Accessibility (AXUIElement)
 
     private func extractViaAX(bundleID: String?) async -> String? {
-        // Get the focused window of the frontmost app
-        let app = NSWorkspace.shared.frontmostApplication
-        let appRef = AXUIElementCreateApplication(app?.processIdentifier ?? 0)
+        // Use the requested app when available (tier1 polling may capture non-frontmost windows).
+        let app: NSRunningApplication?
+        if let bundleID {
+            app = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID }
+                ?? NSWorkspace.shared.frontmostApplication
+        } else {
+            app = NSWorkspace.shared.frontmostApplication
+        }
+
+        guard let targetApp = app else { return nil }
+        let appRef = AXUIElementCreateApplication(targetApp.processIdentifier)
 
         var focusedWindow: CFTypeRef?
         let windowResult = AXUIElementCopyAttributeValue(

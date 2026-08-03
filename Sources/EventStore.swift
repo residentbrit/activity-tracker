@@ -10,7 +10,8 @@ actor EventStore {
 
     init(database: Database) {
         self.db = database
-        self.screenshotDir = "\(NSHomeDirectory())/.local/share/activity-tracker/screenshots"
+        let baseDir = (database.path as NSString).deletingLastPathComponent
+        self.screenshotDir = "\(baseDir)/screenshots"
         try? FileManager.default.createDirectory(atPath: screenshotDir, withIntermediateDirectories: true)
     }
 
@@ -94,8 +95,11 @@ actor EventStore {
     /// Purge screenshots older than configured retention hours (D8).
     func purgeOldScreenshots(retentionHours: Int) throws {
         let sql = """
-            SELECT event_id, path FROM screenshots
-            WHERE created_at < datetime('now', '-\(retentionHours) hours')
+            SELECT s.event_id, s.path
+            FROM screenshots s
+            JOIN events e ON e.id = s.event_id
+            WHERE s.created_at < datetime('now', '-\(retentionHours) hours')
+              AND (e.embedding IS NOT NULL OR e.is_duplicate = 1 OR e.synced = 1)
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db.handle, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -112,7 +116,17 @@ actor EventStore {
             try? FileManager.default.removeItem(atPath: item.path)
         }
 
-        try execute("DELETE FROM screenshots WHERE created_at < datetime('now', '-\(retentionHours) hours')", params: [])
+        let deleteSQL = """
+            DELETE FROM screenshots
+            WHERE event_id IN (
+                SELECT s.event_id
+                FROM screenshots s
+                JOIN events e ON e.id = s.event_id
+                WHERE s.created_at < datetime('now', '-\(retentionHours) hours')
+                  AND (e.embedding IS NOT NULL OR e.is_duplicate = 1 OR e.synced = 1)
+            )
+            """
+        try execute(deleteSQL, params: [])
     }
 
     // MARK: - Audio segments
@@ -167,7 +181,13 @@ actor EventStore {
             let idx = Int32(i + 1)
             switch param {
             case let text as String:
-                sqlite3_bind_text(stmt, idx, (text as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(
+                    stmt,
+                    idx,
+                    (text as NSString).utf8String,
+                    -1,
+                    unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                )
             case let data as Data:
                 _ = data.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, idx, ptr.baseAddress, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))

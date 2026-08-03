@@ -11,15 +11,16 @@ import AVFoundation
 ///
 /// Audio capture is disabled if `audioMode` is `.off` in config.
 actor AudioCapture {
-    private let config: Config
+    private var config: Config
     private let db: Database
     private let eventStore: EventStore
-    private let meetingDetector: MeetingDetector
-    private let embedder: Embedder
+    private var meetingDetector: MeetingDetector
+    private var embedder: Embedder
 
     private var isInMeeting = false
     private var currentMeetingApp: String?
     private var meetingStartTime: Date?
+    private var currentMeetingSession: Session?
     private var audioEngine: AVAudioEngine?
     private var speechSegments: [Data] = []  // Raw PCM chunks that passed VAD
 
@@ -32,6 +33,18 @@ actor AudioCapture {
         self.eventStore = EventStore(database: database)
         self.meetingDetector = MeetingDetector(config: config)
         self.embedder = Embedder(config: config)
+    }
+
+    func applyConfig(_ newConfig: Config) {
+        config = newConfig
+        meetingDetector = MeetingDetector(config: newConfig)
+        embedder = Embedder(config: newConfig)
+
+        if newConfig.audioMode == .off {
+            stop()
+        } else if pollTask == nil {
+            startPolling()
+        }
     }
 
     // MARK: - Public
@@ -73,6 +86,16 @@ actor AudioCapture {
         meetingStartTime = Date()
         speechSegments = []
 
+        let session = Session(
+            id: UUID().uuidString,
+            machineId: Host.current().localizedName ?? "unknown",
+            startedAt: ISO8601DateFormatter().string(from: meetingStartTime ?? Date()),
+            endedAt: nil,
+            timezone: TimeZone.current.identifier
+        )
+        try? await eventStore.insertSession(session)
+        currentMeetingSession = session
+
         fputs("[AudioCapture] meeting started (\(currentMeetingApp ?? "unknown"))\n", stderr)
 
         do {
@@ -94,6 +117,11 @@ actor AudioCapture {
         let endedAt = ISO8601DateFormatter().string(from: Date())
         log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments\n")
 
+        if var session = currentMeetingSession {
+            session.endedAt = endedAt
+            try? await eventStore.updateSession(session)
+        }
+
         guard !speechSegments.isEmpty else {
             currentMeetingApp = nil
             meetingStartTime = nil
@@ -107,11 +135,11 @@ actor AudioCapture {
         let transcript = await transcribeAudio(fullAudio)
 
         // Store in DB, discard raw audio
-        if let transcript, !transcript.isEmpty {
+        if let transcript, !transcript.isEmpty, let sessionId = currentMeetingSession?.id {
             let embedding = await embedder.embed(transcript)
             try? await eventStore.insertAudioSegment(
                 id: UUID().uuidString,
-                sessionId: "",  // TODO: get current session ID
+            sessionId: sessionId,
                 startedAt: ISO8601DateFormatter().string(from: startTime),
                 endedAt: endedAt,
                 meetingApp: currentMeetingApp,
@@ -122,6 +150,7 @@ actor AudioCapture {
 
         currentMeetingApp = nil
         meetingStartTime = nil
+        currentMeetingSession = nil
         speechSegments = []
     }
 
@@ -136,9 +165,24 @@ actor AudioCapture {
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
             guard let self else { return }
             let frameLength = buffer.frameLength
-            guard let channelData = buffer.int16ChannelData else { return }
-            let sampleCount = Int(frameLength) * Int(buffer.format.channelCount)
-            let copy = Data(bytes: channelData.pointee, count: sampleCount * 2)
+            let sampleCount = Int(frameLength)
+
+            let copy: Data?
+            if let int16 = buffer.int16ChannelData {
+                copy = Data(bytes: int16.pointee, count: sampleCount * 2)
+            } else if let floatData = buffer.floatChannelData {
+                var pcm16 = [Int16](repeating: 0, count: sampleCount)
+                let src = floatData.pointee
+                for i in 0..<sampleCount {
+                    let sample = max(-1.0, min(1.0, src[i]))
+                    pcm16[i] = Int16(sample * Float(Int16.max))
+                }
+                copy = pcm16.withUnsafeBytes { Data($0) }
+            } else {
+                copy = nil
+            }
+
+            guard let copy else { return }
             Task { await self.processAudioTap(copy, frameCount: Int(frameLength)) }
         }
 
@@ -170,9 +214,10 @@ actor AudioCapture {
     /// Transcribe audio via whisper.cpp's `whisper-cli` binary.
     /// Writes PCM data to a temp WAV file, runs whisper-cli, returns transcript.
     private nonisolated func transcribeAudio(_ audioData: Data) async -> String? {
+        let config = await self.config
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                let result = Self.runWhisper(audioData, config: self.config)
+                let result = Self.runWhisper(audioData, config: config)
                 continuation.resume(returning: result)
             }
         }

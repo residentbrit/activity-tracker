@@ -183,11 +183,12 @@ actor MCPServer {
     // MARK: - tools/call
 
     private func handleToolCall(id: Any?, params: [String: Any]?) async {
-        guard let toolName = params?["name"] as? String,
-              let arguments = params?["arguments"] as? [String: Any] else {
-            await sendError(id: id, code: -32602, message: "Invalid params: missing name or arguments")
+        guard let toolName = params?["name"] as? String else {
+            await sendError(id: id, code: -32602, message: "Invalid params: missing name")
             return
         }
+
+        let arguments = params?["arguments"] as? [String: Any] ?? [:]
 
         do {
             let result = try await callTool(name: toolName, arguments: arguments)
@@ -281,7 +282,7 @@ actor MCPServer {
             SELECT captured_at, trigger, app_name, window_title, source_type, text_content
             FROM events
             WHERE is_duplicate = 0
-              AND captured_at > datetime('now', '-\(minutes) minutes')
+                            AND datetime(captured_at) > datetime('now', '-\(minutes) minutes')
             ORDER BY captured_at DESC
             LIMIT 50
             """
