@@ -116,6 +116,27 @@ ls ~/.local/share/activity-tracker/screenshots/ | wc -l
 tail -f ~/.local/share/activity-tracker/debug.log
 ```
 
+## Backfill embeddings
+
+If older rows were captured before embedding fixes, run a one-shot backfill:
+
+```bash
+make backfill
+```
+
+Advanced options:
+
+```bash
+# Preview only (no DB updates)
+./scripts/backfill_embeddings.py --dry-run
+
+# Process only a subset
+./scripts/backfill_embeddings.py --limit 100
+
+# Include duplicate rows too
+./scripts/backfill_embeddings.py --include-duplicates
+```
+
 ## Configuration
 
 `~/.config/activity-tracker/config.json` (auto-generated on first run):

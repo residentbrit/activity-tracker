@@ -28,7 +28,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run
+.PHONY: all install clean deps models run backfill
 
 all: $(BINARY) $(LLAMA_EMBED) $(WHISPER_CLI) models
 	@echo ""
@@ -54,6 +54,9 @@ install: all
 
 run: all
 	$(BINARY)
+
+backfill:
+	./scripts/backfill_embeddings.py
 
 # --- Swift binary ---
 
