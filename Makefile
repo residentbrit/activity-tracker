@@ -28,7 +28,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill daemon-install daemon-uninstall
+.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall
 
 all: $(BINARY) $(LLAMA_EMBED) $(WHISPER_CLI) models
 	@echo ""
@@ -72,6 +72,12 @@ run: all
 
 backfill:
 	./scripts/backfill_embeddings.py
+
+migrate-screenpipe:
+	./scripts/migrate_screenpipe.py
+
+migrate-screenpipe-embed:
+	./scripts/backfill_embeddings.py --trigger screenpipe_import
 
 # --- Swift binary ---
 

@@ -126,14 +126,16 @@ def embed_json(text: str, cfg: BackfillConfig) -> tuple[Optional[bytes], Optiona
     return struct.pack("<1024f", *values), None
 
 
-def build_select_sql(include_duplicates: bool, limit: Optional[int]) -> str:
+def build_select_sql(include_duplicates: bool, limit: Optional[int], trigger: Optional[str] = None) -> str:
     where_dups = "1=1" if include_duplicates else "is_duplicate = 0"
+    trigger_clause = f" AND trigger = '{trigger}'" if trigger else ""
     limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
     return (
         "SELECT id, text_content FROM events "
         f"WHERE {where_dups} "
         "AND embedding IS NULL "
         "AND COALESCE(LENGTH(text_content), 0) > 0 "
+        f"{trigger_clause}"
         "ORDER BY captured_at ASC"
         f"{limit_clause}"
     )
@@ -154,7 +156,7 @@ def run(cfg: BackfillConfig) -> int:
     conn.execute("PRAGMA busy_timeout=5000")
     cur = conn.cursor()
 
-    select_sql = build_select_sql(cfg.include_duplicates, cfg.limit)
+    select_sql = build_select_sql(cfg.include_duplicates, cfg.limit, getattr(cfg, 'trigger', None))
     rows = cur.execute(select_sql).fetchall()
 
     total = len(rows)
@@ -224,10 +226,11 @@ def parse_args() -> BackfillConfig:
     p.add_argument("--timeout-sec", type=int, default=90, help="Per-row subprocess timeout")
     p.add_argument("--include-duplicates", action="store_true", help="Also embed duplicate rows")
     p.add_argument("--limit", type=int, default=None, help="Max rows to process")
+    p.add_argument("--trigger", default=None, help="Only embed events with this trigger value (e.g. screenpipe_import)")
     p.add_argument("--dry-run", action="store_true", help="Do not update DB")
     args = p.parse_args()
 
-    return BackfillConfig(
+    cfg = BackfillConfig(
         db_path=args.db,
         embedding_bin=args.embedding_bin,
         model_path=args.model,
@@ -238,7 +241,6 @@ def parse_args() -> BackfillConfig:
         limit=args.limit,
         dry_run=args.dry_run,
     )
-
-
-if __name__ == "__main__":
+    cfg.trigger = args.trigger
+    return cfg
     raise SystemExit(run(parse_args()))
