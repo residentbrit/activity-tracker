@@ -258,14 +258,16 @@ actor CaptureEngine {
     // MARK: - Screen capture
 
     private func captureScreen() async -> CGImage? {
-        // CGDisplayCreateImage may crash (SIGBUS) on Intel Macs without
-        // Screen Recording permission. Check access first.
         guard CGPreflightScreenCaptureAccess() else {
             log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
             return nil
         }
-        let displayID = CGMainDisplayID()
-        return CGDisplayCreateImage(displayID)
+        // CGDisplayCreateImage is unreliable in daemon context; use CGWindowListCreateImage instead
+        let image = CGWindowListCreateImage(.null, .optionOnScreenOnly, kCGNullWindowID, .bestResolution)
+        if image == nil {
+            log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage returned nil\n")
+        }
+        return image
     }
 
     // MARK: - Sessions
