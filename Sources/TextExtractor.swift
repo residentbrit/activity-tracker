@@ -64,21 +64,28 @@ actor TextExtractor {
     }
 
     /// Iterative AX tree walk — avoids stack overflow on GCD threads.
+    /// Stops early once collected text exceeds the cap to avoid blocking on huge documents.
     private func collectAXText(from root: AXUIElement, into result: inout [String]) {
         var stack: [AXUIElement] = [root]
+        var totalChars = 0
+        let charCap = 8000
 
         while let element = stack.popLast() {
             var value: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
                let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 result.append(text)
+                totalChars += text.count
             }
 
             var title: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title) == .success,
                let titleStr = title as? String, !titleStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 result.append(titleStr)
+                totalChars += titleStr.count
             }
+
+            if totalChars >= charCap { break }
 
             var children: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
