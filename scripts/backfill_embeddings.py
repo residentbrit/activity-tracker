@@ -135,7 +135,7 @@ def build_select_sql(include_duplicates: bool, limit: Optional[int], trigger: Op
         f"WHERE {where_dups} "
         "AND embedding IS NULL "
         "AND COALESCE(LENGTH(text_content), 0) > 0 "
-        f"{trigger_clause}"
+        f"{trigger_clause} "
         "ORDER BY captured_at ASC"
         f"{limit_clause}"
     )
@@ -243,4 +243,7 @@ def parse_args() -> BackfillConfig:
     )
     cfg.trigger = args.trigger
     return cfg
+
+
+if __name__ == "__main__":
     raise SystemExit(run(parse_args()))
