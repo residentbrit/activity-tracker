@@ -9,7 +9,11 @@ import Foundation
 /// Falls back to llama-embedding subprocess if server isn't running.
 actor Embedder {
     private let config: Config
+    // nil = unknown, true = server confirmed up, false = server confirmed down
     private var useServer: Bool?
+    // Re-probe server after this many consecutive failures
+    private var serverFailureCount = 0
+    private let serverRetryAfterFailures = 5
     private let serverURL = "http://127.0.0.1:8080"
     private let maxEmbeddingChars = 1500
     private let maxEmbeddingWords = 200
@@ -81,8 +85,10 @@ actor Embedder {
         guard !batch.isEmpty else { return }
 
         // Determine mode: try server first, fall back to subprocess
-        if useServer == nil {
+        // Re-probe if unknown or if server has failed enough times
+        if useServer == nil || (useServer == false && serverFailureCount >= serverRetryAfterFailures) {
             useServer = await checkServer()
+            serverFailureCount = 0
         }
 
         if useServer == true {
@@ -111,6 +117,15 @@ actor Embedder {
         log("[Embedder] batching \(batch.count) texts via server\n")
         for (text, cont) in batch {
             let result = await embedViaServer(text)
+            if result == nil {
+                serverFailureCount += 1
+                if serverFailureCount >= serverRetryAfterFailures {
+                    log("[Embedder] server failing repeatedly — will re-probe next batch\n")
+                    useServer = nil
+                }
+            } else {
+                serverFailureCount = 0
+            }
             cont.resume(returning: result)
         }
     }

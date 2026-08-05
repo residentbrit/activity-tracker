@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.activitytracker.embedserver</string>
+	<key>Program</key>
+	<string>%HOME%/.local/bin/llama-server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%HOME%/.local/bin/llama-server</string>
+		<string>--model</string>
+		<string>%HOME%/.local/share/activity-tracker/models/mxbai-embed-large.gguf</string>
+		<string>--port</string>
+		<string>8080</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--embedding</string>
+		<string>--ctx-size</string>
+		<string>512</string>
+		<string>--n-gpu-layers</string>
+		<string>99</string>
+		<string>--log-disable</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>%HOME%/.local/share/activity-tracker/logs/embedserver.log</string>
+	<key>StandardErrorPath</key>
+	<string>%HOME%/.local/share/activity-tracker/logs/embedserver.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+</dict>
+</plist>

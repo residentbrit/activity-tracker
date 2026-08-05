@@ -17,7 +17,8 @@ WHISPER_SRC := $(BUILD_DIR)/whisper.cpp
 NPROC       := $(shell sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
 # Binaries
-LLAMA_EMBED := $(BUILD_DIR)/bin/llama-embedding
+LLAMA_EMBED  := $(BUILD_DIR)/bin/llama-embedding
+LLAMA_SERVER := $(BUILD_DIR)/bin/llama-server
 WHISPER_CLI := $(BUILD_DIR)/bin/whisper-cli
 
 # Models
@@ -28,9 +29,9 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall
+.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install
 
-all: $(BINARY) $(LLAMA_EMBED) $(WHISPER_CLI) models
+all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 	@echo ""
 	@echo "==> Build complete: $(BINARY)"
 	@echo "    Run: make install   (installs to $(PREFIX)/bin)"
@@ -40,6 +41,7 @@ install: all
 	mkdir -p $(BIN_DIR) $(MODEL_DIR)
 	cp $(BINARY) $(BIN_DIR)/activity-tracker
 	cp $(LLAMA_EMBED) $(BIN_DIR)/
+	cp $(LLAMA_SERVER) $(BIN_DIR)/
 	cp $(WHISPER_CLI) $(BIN_DIR)/
 	cp -n $(EMBED_MODEL) $(MODEL_DIR)/ 2>/dev/null || true
 	cp -n $(WHISPER_MODEL) $(MODEL_DIR)/ 2>/dev/null || true
@@ -64,8 +66,19 @@ daemon-install: install
 
 daemon-uninstall:
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist || true
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist || true
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
-	@echo "==> Daemon stopped and removed"
+	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist
+	@echo "==> Daemons stopped and removed"
+
+embedserver-install: install
+	mkdir -p $(HOME)/.local/share/activity-tracker/logs
+	sed 's|%HOME%|$(HOME)|g' launchd/com.activitytracker.embedserver.plist > $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist
+	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist
+	@echo ""
+	@echo "==> Embed server installed and started (port 8080)"
+	@echo "    Monitor: tail -f $(HOME)/.local/share/activity-tracker/logs/embedserver.log"
+	@echo "    Status:  launchctl list com.activitytracker.embedserver"
 
 run: all
 	$(BINARY)
@@ -89,7 +102,7 @@ $(LLAMA_SRC):
 	git clone --depth 1 https://github.com/ggerganov/llama.cpp.git $(LLAMA_SRC)
 
 $(LLAMA_EMBED): $(LLAMA_SRC)
-	@echo "==> Building llama.cpp (llama-embedding) …"
+	@echo "==> Building llama.cpp (llama-embedding + llama-server) …"
 	@# Fix: missing <cerrno> include on macOS with Apple Clang 16
 	@if ! grep -q '<cerrno>' $(LLAMA_SRC)/ggml/src/gguf.cpp; then \
 		sed -i '' '1s/^/#include <cerrno>\n/' $(LLAMA_SRC)/ggml/src/gguf.cpp; \
@@ -97,13 +110,16 @@ $(LLAMA_EMBED): $(LLAMA_SRC)
 	cd $(LLAMA_SRC) && cmake -B build \
 		-DLLAMA_BUILD_EXAMPLES=ON \
 		-DLLAMA_BUILD_TESTS=OFF \
-		-DLLAMA_BUILD_SERVER=OFF \
+		-DLLAMA_BUILD_SERVER=ON \
 		-DGGML_METAL=ON \
 		-DLLAMA_CURL=OFF \
 		-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON
-	cd $(LLAMA_SRC) && cmake --build build --target llama-embedding -j$(NPROC)
+	cd $(LLAMA_SRC) && cmake --build build --target llama-embedding llama-server -j$(NPROC)
 	mkdir -p $(dir $(LLAMA_EMBED))
 	cp $(LLAMA_SRC)/build/bin/llama-embedding $(LLAMA_EMBED)
+
+$(LLAMA_SERVER): $(LLAMA_EMBED)
+	cp $(LLAMA_SRC)/build/bin/llama-server $(LLAMA_SERVER)
 
 # --- whisper.cpp (uses cmake — they also dropped the plain Makefile) ---
 
