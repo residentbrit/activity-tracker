@@ -238,7 +238,22 @@ actor MCPServer {
         // Full-text search over text_content + structured fields.
         // When llama.cpp is integrated, this becomes semantic search via embeddings.
         let sql = """
-            SELECT captured_at, app_name, window_title, source_type, text_content
+                        SELECT captured_at,
+                                     app_name,
+                                     window_title,
+                                     source_type,
+                                     text_content,
+                                     CASE
+                                         WHEN text_content LIKE ? THEN 'text_content'
+                                         WHEN window_title LIKE ? THEN 'window_title'
+                                         WHEN app_name LIKE ? THEN 'app_name'
+                                         ELSE 'unknown'
+                                     END AS match_source,
+                                     CASE
+                                         WHEN COALESCE(text_content, '') != '' THEN text_content
+                                         WHEN COALESCE(window_title, '') != '' THEN window_title
+                                         ELSE COALESCE(app_name, '')
+                                     END AS display_text
             FROM events
             WHERE is_duplicate = 0
               AND (text_content LIKE ? OR window_title LIKE ? OR app_name LIKE ?)
@@ -254,10 +269,13 @@ actor MCPServer {
         let stmt = stmtPointer!
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, pattern, -1, nil)
-        sqlite3_bind_text(stmt, 2, pattern, -1, nil)
-        sqlite3_bind_text(stmt, 3, pattern, -1, nil)
-        sqlite3_bind_int(stmt, 4, Int32(limit))
+        bindText(stmt, 1, pattern)
+        bindText(stmt, 2, pattern)
+        bindText(stmt, 3, pattern)
+        bindText(stmt, 4, pattern)
+        bindText(stmt, 5, pattern)
+        bindText(stmt, 6, pattern)
+        sqlite3_bind_int(stmt, 7, Int32(limit))
 
         var results: [[String: Any]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -266,7 +284,9 @@ actor MCPServer {
                 "app_name": columnTextOrNull(stmt, 1) ?? "",
                 "window_title": columnTextOrNull(stmt, 2) ?? "",
                 "source_type": columnText(stmt, 3),
-                "text": columnText(stmt, 4)
+                "text": columnText(stmt, 6),
+                "match_source": columnText(stmt, 5),
+                "matched_value": matchedValue(stmt: stmt)
             ])
         }
 
@@ -338,7 +358,10 @@ actor MCPServer {
             WHERE 1=1
             """
         if date != nil {
-            sql += " AND date(started_at) = ?"
+            sql += """
+                 AND date(datetime(started_at, 'localtime')) <= date(?)
+                 AND date(datetime(COALESCE(ended_at, started_at), 'localtime')) >= date(?)
+                """
         }
         if machineId != nil {
             sql += " AND machine_id = ?"
@@ -354,11 +377,13 @@ actor MCPServer {
 
         var idx: Int32 = 1
         if let date = date {
-            sqlite3_bind_text(stmt, idx, date, -1, nil)
+            bindText(stmt, idx, date)
+            idx += 1
+            bindText(stmt, idx, date)
             idx += 1
         }
         if let machineId = machineId {
-            sqlite3_bind_text(stmt, idx, machineId, -1, nil)
+            bindText(stmt, idx, machineId)
         }
 
         var results: [[String: Any]] = []
@@ -395,7 +420,7 @@ actor MCPServer {
         let stmt = stmtPointer!
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, sessionId, -1, nil)
+        bindText(stmt, 1, sessionId)
 
         var events: [[String: Any]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -466,6 +491,30 @@ private func columnText(_ stmt: OpaquePointer, _ idx: Int32) -> String {
 private func columnTextOrNull(_ stmt: OpaquePointer, _ idx: Int32) -> String? {
     guard let ptr = sqlite3_column_text(stmt, idx) else { return nil }
     return String(cString: ptr)
+}
+
+private func matchedValue(stmt: OpaquePointer) -> String {
+    let matchSource = columnText(stmt, 5)
+    switch matchSource {
+    case "text_content":
+        return columnText(stmt, 4)
+    case "window_title":
+        return columnTextOrNull(stmt, 2) ?? ""
+    case "app_name":
+        return columnTextOrNull(stmt, 1) ?? ""
+    default:
+        return columnText(stmt, 6)
+    }
+}
+
+private func bindText(_ stmt: OpaquePointer, _ idx: Int32, _ value: String) {
+    sqlite3_bind_text(
+        stmt,
+        idx,
+        (value as NSString).utf8String,
+        -1,
+        unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    )
 }
 
 /// Encode anything JSON-encodable to a pretty-printed string.

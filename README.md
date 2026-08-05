@@ -27,6 +27,14 @@ make install
 
 On first run it writes a default config to `~/.config/activity-tracker/config.json`. The daemon runs in the foreground — no GUI, no dock icon.
 
+To run capture, sync, and audio collection without the MCP stdio server, use:
+
+```bash
+~/.local/bin/activity-tracker --collector-only
+```
+
+That mode is the intended runtime building block for a future `launchd` setup, since it does not depend on an MCP client keeping stdio open.
+
 ### macOS permissions
 
 You'll be prompted for:
@@ -136,6 +144,11 @@ Advanced options:
 # Include duplicate rows too
 ./scripts/backfill_embeddings.py --include-duplicates
 ```
+
+## Known gaps
+
+1. TODO: add a per-app exclusion list before unattended always-on use, so sensitive apps and windows can be skipped.
+2. Slack answers are currently limited to what was actually visible on screen; channel-aware history would require a separate Slack API integration.
 
 ## Configuration
 

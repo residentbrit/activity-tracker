@@ -28,7 +28,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill
+.PHONY: all install clean deps models run backfill daemon-install daemon-uninstall
 
 all: $(BINARY) $(LLAMA_EMBED) $(WHISPER_CLI) models
 	@echo ""
@@ -51,6 +51,21 @@ install: all
 	@echo "    Grant permissions in System Settings:"
 	@echo "      Privacy → Accessibility       (for window text extraction)"
 	@echo "      Privacy → Screen Recording    (for screenshot capture)"
+
+daemon-install: install
+	mkdir -p $(HOME)/.local/share/activity-tracker/logs
+	sed 's|%HOME%|$(HOME)|g' launchd/com.activitytracker.collector.plist > $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
+	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
+	@echo ""
+	@echo "==> Daemon installed and started"
+	@echo "    Monitor: tail -f $(HOME)/.local/share/activity-tracker/logs/collector.log"
+	@echo "    Status:  launchctl list com.activitytracker.collector"
+	@echo "    Stop:    launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist"
+
+daemon-uninstall:
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist || true
+	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
+	@echo "==> Daemon stopped and removed"
 
 run: all
 	$(BINARY)

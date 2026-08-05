@@ -8,3 +8,5 @@ activity.db
 activity.db-wal
 activity.db-shm
 .build/deps/
+*.ips
+error.log

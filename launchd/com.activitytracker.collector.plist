@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.activitytracker.collector</string>
+	<key>Program</key>
+	<string>%HOME%/.local/bin/activity-tracker</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%HOME%/.local/bin/activity-tracker</string>
+		<string>--collector-only</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>StandardOutPath</key>
+	<string>%HOME%/.local/share/activity-tracker/logs/collector.log</string>
+	<key>StandardErrorPath</key>
+	<string>%HOME%/.local/share/activity-tracker/logs/collector-error.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

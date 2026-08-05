@@ -8,6 +8,7 @@ private var retainedSignalSources: [DispatchSourceSignal] = []
 @main
 struct ActivityTracker {
     static func main() async throws {
+        let options = RuntimeOptions(arguments: CommandLine.arguments)
 
         // 1. Load config
         log("loading config…")
@@ -68,9 +69,13 @@ struct ActivityTracker {
                 log("capture engine starting…")
                 await captureEngine.run()
             }
-            group.addTask {
-                log("mcp server starting…")
-                await mcpServer.run()
+            if !options.collectorOnly {
+                group.addTask {
+                    log("mcp server starting…")
+                    await mcpServer.run()
+                }
+            } else {
+                log("collector-only mode: MCP server disabled")
             }
             group.addTask {
                 log("sync engine starting…")
@@ -81,5 +86,13 @@ struct ActivityTracker {
                 await audioCapture.startPolling()
             }
         }
+    }
+}
+
+private struct RuntimeOptions {
+    let collectorOnly: Bool
+
+    init(arguments: [String]) {
+        collectorOnly = arguments.contains("--collector-only")
     }
 }
