@@ -115,21 +115,29 @@ actor TextExtractor {
 
     private func extractViaOCR(image: CGImage) async -> String? {
         return await withCheckedContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                guard error == nil,
-                      let observations = request.results as? [VNRecognizedTextObservation] else {
-                    continuation.resume(returning: nil)
-                    return
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let request = VNRecognizeTextRequest { request, error in
+                    guard error == nil,
+                          let observations = request.results as? [VNRecognizedTextObservation] else {
+                        sem.signal()
+                        return
+                    }
+                    let text = observations.compactMap { $0.topCandidates(1).first?.string }
+                        .joined(separator: "\n")
+                    continuation.resume(returning: text)
+                    sem.signal()
                 }
-                let text = observations.compactMap { $0.topCandidates(1).first?.string }
-                    .joined(separator: "\n")
-                continuation.resume(returning: text)
+                request.recognitionLevel = .accurate
+                request.usesLanguageCorrection = true
+                let handler = VNImageRequestHandler(cgImage: image, options: [:])
+                try? handler.perform([request])
             }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-
-            let handler = VNImageRequestHandler(cgImage: image, options: [:])
-            try? handler.perform([request])
+            // 8-second timeout for OCR — Vision can hang on problematic images
+            if sem.wait(timeout: .now() + 8) == .timedOut {
+                log("[TextExtractor] OCR timed out\n")
+                continuation.resume(returning: nil)
+            }
         }
     }
 }

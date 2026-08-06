@@ -295,12 +295,25 @@ actor CaptureEngine {
             log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
             return nil
         }
-        // CGDisplayCreateImage is unreliable in daemon context; use CGWindowListCreateImage instead
-        let image = CGWindowListCreateImage(.null, .optionOnScreenOnly, kCGNullWindowID, .bestResolution)
-        if image == nil {
-            log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage returned nil\n")
+        // Run CGWindowListCreateImage on a background thread with timeout —
+        // the API can block indefinitely in certain macOS states
+        return await withCheckedContinuation { continuation in
+            let sem = DispatchSemaphore(value: 0)
+            var captured: CGImage? = nil
+            DispatchQueue.global(qos: .userInitiated).async {
+                captured = CGWindowListCreateImage(.null, .optionOnScreenOnly, kCGNullWindowID, .bestResolution)
+                sem.signal()
+            }
+            if sem.wait(timeout: .now() + 5) == .timedOut {
+                log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage timed out\n")
+                continuation.resume(returning: nil)
+            } else {
+                if captured == nil {
+                    log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage returned nil\n")
+                }
+                continuation.resume(returning: captured)
+            }
         }
-        return image
     }
 
     // MARK: - Sessions
@@ -313,8 +326,12 @@ actor CaptureEngine {
             endedAt: nil,
             timezone: TimeZone.current.identifier
         )
-        try? await eventStore.insertSession(session)
-        currentSession = session
+        do {
+            try await eventStore.insertSession(session)
+            currentSession = session
+        } catch {
+            log("[CaptureEngine] startNewSession failed: \(error)\n")
+        }
     }
 
     private func closeCurrentSession() async {
