@@ -40,6 +40,7 @@ all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 install: all
 	mkdir -p $(BIN_DIR) $(MODEL_DIR)
 	cp $(BINARY) $(BIN_DIR)/activity-tracker
+	codesign --force --sign "ActivityTracker Dev" $(BIN_DIR)/activity-tracker 2>/dev/null || true
 	cp $(LLAMA_EMBED) $(BIN_DIR)/
 	cp $(LLAMA_SERVER) $(BIN_DIR)/
 	cp $(WHISPER_CLI) $(BIN_DIR)/
