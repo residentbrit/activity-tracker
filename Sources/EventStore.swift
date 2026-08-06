@@ -80,6 +80,32 @@ actor EventStore {
         try execute(sql, params: [embedding, eventId])
     }
 
+    /// Fetch unembedded non-duplicate events, excluding bulk imports. Used for startup sweep.
+    func fetchUnembedded(limit: Int) throws -> [(id: String, text: String)] {
+        let sql = """
+            SELECT id, text_content FROM events
+            WHERE embedding IS NULL
+              AND is_duplicate = 0
+              AND LENGTH(text_content) > 0
+              AND trigger NOT IN ('screenpipe_import', 'screenpipe_audio_import')
+            ORDER BY captured_at ASC
+            LIMIT ?
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.executeFailed(String(cString: sqlite3_errmsg(db.handle)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, Int64(limit))
+        var rows: [(id: String, text: String)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id   = String(cString: sqlite3_column_text(stmt, 0))
+            let text = String(cString: sqlite3_column_text(stmt, 1))
+            rows.append((id: id, text: text))
+        }
+        return rows
+    }
+
     // MARK: - Screenshots
 
     func saveScreenshot(eventId: String, imageData: Data) throws {

@@ -66,8 +66,36 @@ actor CaptureEngine {
         log("[CaptureEngine] monitor started\n")
 
         startTimers()
+        startEmbeddingBackfill()
 
         // run() returns — tasks keep running in background
+    }
+
+    // MARK: - Startup embedding backfill
+
+    /// Background sweep: embeds any events left unembedded from previous runs.
+    /// Runs at background priority in batches to avoid starving live captures.
+    private func startEmbeddingBackfill() {
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            let batchSize = 20
+            var swept = 0
+            while true {
+                let rows = (try? await self.eventStore.fetchUnembedded(limit: batchSize)) ?? []
+                if rows.isEmpty { break }
+                for row in rows {
+                    if let emb = await self.embedder.embed(row.text) {
+                        try? await self.eventStore.updateEmbedding(eventId: row.id, embedding: emb)
+                        swept += 1
+                    }
+                }
+                // Yield between batches so live captures get embed server time
+                try? await Task.sleep(for: .seconds(2))
+            }
+            if swept > 0 {
+                log("[CaptureEngine] startup backfill complete: \(swept) events embedded\n")
+            }
+        }
     }
 
     private func startTimers() {
