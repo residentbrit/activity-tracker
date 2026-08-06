@@ -10,3 +10,5 @@ activity.db-shm
 .build/deps/
 *.ips
 error.log
+__pycache__/
+*.pyc
