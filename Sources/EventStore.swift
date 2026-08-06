@@ -99,9 +99,9 @@ actor EventStore {
         sqlite3_bind_int64(stmt, 1, Int64(limit))
         var rows: [(id: String, text: String)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let id   = String(cString: sqlite3_column_text(stmt, 0))
-            let text = String(cString: sqlite3_column_text(stmt, 1))
-            rows.append((id: id, text: text))
+            guard let idPtr  = sqlite3_column_text(stmt, 0),
+                  let txtPtr = sqlite3_column_text(stmt, 1) else { continue }
+            rows.append((id: String(cString: idPtr), text: String(cString: txtPtr)))
         }
         return rows
     }
