@@ -258,13 +258,18 @@ actor CaptureEngine {
         let filePath = extractFilePath(from: windowTitle, axText: text)
         log("[CaptureEngine] storing event \(trigger) \(sourceType) text:\(text.count)c\n")
 
-        try? await eventStore.insertEvent(
-            id: eventId, sessionId: sessionId, capturedAt: capturedAt,
-            trigger: trigger, appBundleID: bundleID, appName: appName,
-            windowTitle: windowTitle, activeFilePath: filePath,
-            sourceType: sourceType, textContent: text,
-            embedding: nil, dedupKey: dedupKey, isDuplicate: false
-        )
+        do {
+            try await eventStore.insertEvent(
+                id: eventId, sessionId: sessionId, capturedAt: capturedAt,
+                trigger: trigger, appBundleID: bundleID, appName: appName,
+                windowTitle: windowTitle, activeFilePath: filePath,
+                sourceType: sourceType, textContent: text,
+                embedding: nil, dedupKey: dedupKey, isDuplicate: false
+            )
+        } catch {
+            log("[CaptureEngine] insertEvent failed: \(error)\n")
+            return
+        }
 
         // 5. Save screenshot AFTER event exists
         if let pngData = image.pngData() {

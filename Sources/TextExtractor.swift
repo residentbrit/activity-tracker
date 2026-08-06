@@ -83,21 +83,25 @@ actor TextExtractor {
         let charCap = 8000
 
         while let element = stack.popLast() {
+            if totalChars >= charCap { break }
+
             var value: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success,
                let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(text)
-                totalChars += text.count
+                let chunk = String(text.prefix(charCap - totalChars))
+                result.append(chunk)
+                totalChars += chunk.count
             }
+
+            if totalChars >= charCap { break }
 
             var title: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title) == .success,
                let titleStr = title as? String, !titleStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(titleStr)
-                totalChars += titleStr.count
+                let chunk = String(titleStr.prefix(charCap - totalChars))
+                result.append(chunk)
+                totalChars += chunk.count
             }
-
-            if totalChars >= charCap { break }
 
             var children: CFTypeRef?
             if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
