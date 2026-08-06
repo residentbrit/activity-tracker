@@ -66,7 +66,7 @@ actor CaptureEngine {
         log("[CaptureEngine] monitor started\n")
 
         startTimers()
-        startEmbeddingBackfill()
+        // startEmbeddingBackfill()  // temporarily disabled — run via make backfill
 
         // run() returns — tasks keep running in background
     }
@@ -295,8 +295,8 @@ actor CaptureEngine {
             log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
             return nil
         }
-        // Run CGWindowListCreateImage on a background thread with timeout —
-        // the API can block indefinitely in certain macOS states
+        // Run CGWindowListCreateImage on a background thread with timeout.
+        // sem.wait() runs on DispatchQueue — never block Swift concurrency threads.
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
             var captured: CGImage? = nil
@@ -304,11 +304,10 @@ actor CaptureEngine {
                 captured = CGWindowListCreateImage(.null, .optionOnScreenOnly, kCGNullWindowID, .bestResolution)
                 sem.signal()
             }
-            if sem.wait(timeout: .now() + 5) == .timedOut {
-                log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage timed out\n")
-                continuation.resume(returning: nil)
-            } else {
-                if captured == nil {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if sem.wait(timeout: .now() + 5) == .timedOut {
+                    log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage timed out\n")
+                } else if captured == nil {
                     log("[CaptureEngine] ⚠️ captureScreen: CGWindowListCreateImage returned nil\n")
                 }
                 continuation.resume(returning: captured)

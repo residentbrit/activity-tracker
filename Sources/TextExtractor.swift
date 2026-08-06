@@ -5,7 +5,8 @@ import Cocoa
 /// AX-first, OCR-fallback text extraction (D3).
 /// Accessibility tree is fast, free, resolution-independent.
 /// Vision OCR only fires when AX comes back empty.
-actor TextExtractor {
+/// Not an actor — extractions run concurrently on GCD threads, one per capture.
+final class TextExtractor: Sendable {
 
     struct ExtractionResult {
         let text: String
@@ -37,7 +38,6 @@ actor TextExtractor {
     // MARK: - Accessibility (AXUIElement)
 
     private func extractViaAX(bundleID: String?) async -> String? {
-        // Use the requested app when available (tier1 polling may capture non-frontmost windows).
         let app: NSRunningApplication?
         if let bundleID {
             app = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID }
@@ -45,31 +45,30 @@ actor TextExtractor {
         } else {
             app = NSWorkspace.shared.frontmostApplication
         }
-
         guard let targetApp = app else { return nil }
-        let appRef = AXUIElementCreateApplication(targetApp.processIdentifier)
+        let pid = targetApp.processIdentifier
 
-        var focusedWindow: CFTypeRef?
-        let windowResult = AXUIElementCopyAttributeValue(
-            appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow
-        )
-        guard windowResult == .success, let window = focusedWindow else { return nil }
-
-        // Walk the AX tree with a hard timeout — a single hung AX call can block indefinitely
+        // Run ALL AX calls on a background thread — any AX call can block indefinitely
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
             var result: String? = nil
             DispatchQueue.global(qos: .userInitiated).async {
+                let appRef = AXUIElementCreateApplication(pid)
+                var focusedWindow: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+                      let window = focusedWindow else {
+                    sem.signal()
+                    return
+                }
                 var allText: [String] = []
                 self.collectAXText(from: window as! AXUIElement, into: &allText)
                 result = allText.joined(separator: "\n")
                 sem.signal()
             }
-            // 3-second timeout: if AX hangs, return nil and fall through to OCR
-            if sem.wait(timeout: .now() + 3) == .timedOut {
-                log("[TextExtractor] AX extraction timed out — falling back to OCR\n")
-                continuation.resume(returning: nil)
-            } else {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if sem.wait(timeout: .now() + 3) == .timedOut {
+                    log("[TextExtractor] AX extraction timed out — falling back to OCR\n")
+                }
                 continuation.resume(returning: result)
             }
         }
@@ -114,6 +113,7 @@ actor TextExtractor {
     // MARK: - Vision OCR
 
     private func extractViaOCR(image: CGImage) async -> String? {
+        // sem.wait() runs on DispatchQueue to avoid blocking Swift concurrency threads
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
             var ocrResult: String? = nil
@@ -131,10 +131,12 @@ actor TextExtractor {
                 let handler = VNImageRequestHandler(cgImage: image, options: [:])
                 try? handler.perform([request])
             }
-            if sem.wait(timeout: .now() + 8) == .timedOut {
-                log("[TextExtractor] OCR timed out\n")
+            DispatchQueue.global(qos: .userInitiated).async {
+                if sem.wait(timeout: .now() + 8) == .timedOut {
+                    log("[TextExtractor] OCR timed out\n")
+                }
+                continuation.resume(returning: ocrResult)
             }
-            continuation.resume(returning: ocrResult)
         }
     }
 }
