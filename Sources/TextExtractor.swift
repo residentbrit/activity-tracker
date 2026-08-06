@@ -55,11 +55,23 @@ actor TextExtractor {
         )
         guard windowResult == .success, let window = focusedWindow else { return nil }
 
-        // Walk the AX tree for all visible text elements
+        // Walk the AX tree with a hard timeout — a single hung AX call can block indefinitely
         return await withCheckedContinuation { continuation in
-            var allText: [String] = []
-            collectAXText(from: window as! AXUIElement, into: &allText)
-            continuation.resume(returning: allText.joined(separator: "\n"))
+            let sem = DispatchSemaphore(value: 0)
+            var result: String? = nil
+            DispatchQueue.global(qos: .userInitiated).async {
+                var allText: [String] = []
+                self.collectAXText(from: window as! AXUIElement, into: &allText)
+                result = allText.joined(separator: "\n")
+                sem.signal()
+            }
+            // 3-second timeout: if AX hangs, return nil and fall through to OCR
+            if sem.wait(timeout: .now() + 3) == .timedOut {
+                log("[TextExtractor] AX extraction timed out — falling back to OCR\n")
+                continuation.resume(returning: nil)
+            } else {
+                continuation.resume(returning: result)
+            }
         }
     }
 
