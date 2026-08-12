@@ -22,16 +22,17 @@ struct ActivityTracker {
         log("config loaded")
 
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)
+        //    MCP-only mode opens read-only — it must never write or create the DB.
         log("opening database…")
         let db: Database
         do {
-            db = try Database(config: config)
+            db = try Database(config: config, readOnly: !options.collectorOnly)
         } catch {
             let fallbackDir = "\(FileManager.default.currentDirectoryPath)/.activity-tracker/.local/share/activity-tracker"
             try? FileManager.default.createDirectory(atPath: fallbackDir, withIntermediateDirectories: true)
             config.dbPath = "\(fallbackDir)/activity.db"
             log("database open failed at configured path; retrying with fallback path: \(config.dbPath)")
-            db = try Database(config: config)
+            db = try Database(config: config, readOnly: !options.collectorOnly)
         }
         log("database ready")
 
@@ -65,25 +66,27 @@ struct ActivityTracker {
         // Run until SIGTERM/SIGINT
         log("entering run loop…")
         await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                log("capture engine starting…")
-                await captureEngine.run()
-            }
-            if !options.collectorOnly {
+            if options.collectorOnly {
+                // Collector daemon: capture + sync + audio, read-write DB
+                group.addTask {
+                    log("capture engine starting…")
+                    await captureEngine.run()
+                }
+                group.addTask {
+                    log("sync engine starting…")
+                    await syncEngine.run()
+                }
+                group.addTask {
+                    log("audio capture starting…")
+                    await audioCapture.startPolling()
+                }
+            } else {
+                // MCP mode: query server only, read-only DB — never captures or writes
+                log("mcp-only mode: capture/sync/audio disabled")
                 group.addTask {
                     log("mcp server starting…")
                     await mcpServer.run()
                 }
-            } else {
-                log("collector-only mode: MCP server disabled")
-            }
-            group.addTask {
-                log("sync engine starting…")
-                await syncEngine.run()
-            }
-            group.addTask {
-                log("audio capture starting…")
-                await audioCapture.startPolling()
             }
         }
     }

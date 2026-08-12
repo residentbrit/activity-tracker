@@ -224,7 +224,7 @@ actor CaptureEngine {
                 embedding: nil, dedupKey: dedupKey, isDuplicate: true
             )
             // Still save screenshot for deduplicated events
-            if let pngData = image.pngData() {
+            if let pngData = image.downscaledPNGData() {
                 do {
                     try await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
                 } catch {
@@ -272,7 +272,7 @@ actor CaptureEngine {
         }
 
         // 5. Save screenshot AFTER event exists
-        if let pngData = image.pngData() {
+        if let pngData = image.downscaledPNGData() {
             try? await eventStore.saveScreenshot(eventId: eventId, imageData: pngData)
         }
 
@@ -587,6 +587,31 @@ struct Session: Codable {
 extension CGImage {
     func pngData() -> Data? {
         let rep = NSBitmapImageRep(cgImage: self)
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    /// Downscale to a max dimension (default 2000px) before PNG encoding.
+    /// Full-Retina screenshots (7814px wide) are ~8MB each; downscaled ~300KB.
+    func downscaledPNGData(maxDimension: Int = 2000) -> Data? {
+        let width = CGFloat(self.width)
+        let height = CGFloat(self.height)
+        let scale = min(1.0, CGFloat(maxDimension) / max(width, height))
+        let newWidth = Int(width * scale)
+        let newHeight = Int(height * scale)
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: newWidth,
+            height: newHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return pngData() }
+        ctx.interpolationQuality = .high
+        ctx.draw(self, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+        guard let scaled = ctx.makeImage() else { return pngData() }
+        let rep = NSBitmapImageRep(cgImage: scaled)
         return rep.representation(using: .png, properties: [:])
     }
 }

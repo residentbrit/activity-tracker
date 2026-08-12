@@ -6,25 +6,37 @@ import SQLite3
 final class Database {
     private var db: OpaquePointer?
     let path: String
+    private let readOnly: Bool
 
-    init(config: Config) throws {
+    init(config: Config, readOnly: Bool = false) throws {
         self.path = config.dbPath
+        self.readOnly = readOnly
 
-        // Ensure directory exists
-        let dir = (path as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(
-            atPath: dir, withIntermediateDirectories: true
-        )
+        if !readOnly {
+            // Ensure directory exists (read-only mode must not create dirs)
+            let dir = (path as NSString).deletingLastPathComponent
+            try FileManager.default.createDirectory(
+                atPath: dir, withIntermediateDirectories: true
+            )
+        }
 
-        guard sqlite3_open(path, &db) == SQLITE_OK else {
+        let flags: Int32 = readOnly ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        guard sqlite3_open_v2(path, &db, flags, nil) == SQLITE_OK else {
             throw DatabaseError.openFailed(String(cString: sqlite3_errmsg(db)))
         }
 
         // WAL mode for concurrent reads during writes
         _ = try? execute("PRAGMA journal_mode=WAL")
         _ = try? execute("PRAGMA foreign_keys=ON")
+        // Wait up to 5s on contention instead of failing with "database is locked"
+        _ = try? execute("PRAGMA busy_timeout=5000")
+        if !readOnly {
+            _ = try? execute("PRAGMA synchronous=NORMAL")
+        }
 
-        try migrate()
+        if !readOnly {
+            try migrate()
+        }
     }
 
     deinit {
