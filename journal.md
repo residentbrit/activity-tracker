@@ -305,3 +305,110 @@ database corruption at line 77010
 2. **No app exclusion list** — captures everything (banking, passwords, etc.)
 3. **VS Code chat harvester** — planned but not yet implemented
 4. **Embed server uses subprocess as fallback** — works but slow if server is down
+
+---
+
+## 2026-08-12
+
+### Session Summary
+Post-stabilization audit. Fixed the last architectural issues: DB write contention, screenshot disk bloat, and a hidden double-capture-engine bug. Also investigated why Claude reported "no activity" and corrected a LibreWolf tier1 config error.
+
+---
+
+### 1. LibreWolf Tier1 Bundle ID Fix
+
+**Symptom:** LibreWolf (browser) barely showing in captures — 1 event/day despite heavy browsing.
+
+**Root cause:** Config `tier1BundleIDs` had `io.gitlab.librewolf-community` but the actual bundle ID is `net.librewolf.librewolf`. LibreWolf was excluded from the 5-second per-window polling loop, only captured on app switches.
+
+**Fix:** Corrected bundle ID in `~/.config/activity-tracker/config.json`. (Config lives outside the repo, so no commit needed.)
+
+---
+
+### 2. Investigated "No activity recorded for 8/11"
+
+**Claim:** Claude (via MCP) reported no activity for 8/11.
+
+**Finding:** 669 events existed. Claude's report was wrong — likely a stale MCP connection or the MCP process needing restart.
+
+**Deeper issue discovered while investigating:** capture quality was degraded:
+- Only `tier1_poll` trigger firing (669 events)
+- No heartbeat/app_switch/typing events — those captures were timing out
+- OCR nearly useless (79 events, avg 12 chars)
+
+---
+
+### 3. Full-Screen Capture Timing Out (100% failure)
+
+**Symptom:** `captureScreen()` (full-desktop composite via `kCGNullWindowID`) timed out on every call. 2,104 event-driven captures started → 2,105 timeouts on 8/11.
+
+**Analysis:** Full-screen composite at `.bestResolution` (7,814×4,406 = 15M pixels) is heavy. The 5s timeout abandons the call but doesn't cancel it — the stuck `CGWindowListCreateImage` keeps running, exhausting window-server resources. Feedback loop: abandoned calls pile up → everything times out.
+
+**Status:** Still open — per-window capture is the planned fix (reuse the tier1 code path that works).
+
+---
+
+### 4. Screenshot Disk Bloat (35GB)
+
+**Finding:** Screenshots were full-Retina desktop composites at 8MB each. 2,258/day = ~18GB/day.
+
+**Two fixes applied:**
+1. **Downscaling** — new `downscaledPNGData(maxDimension: 2000)` method. 8MB → ~1MB per screenshot (7x reduction).
+2. **Purge fix** — `purgeOldScreenshots` was gating deletion on `embedding IS NOT NULL OR is_duplicate OR synced`, so screenshots whose events hadn't been embedded yet were never purged → orphans.
+
+**Backlog cleanup:** Manually deleted 1,781 old files (>24h) + orphaned files + stale DB rows. 35GB → 19GB, settling to ~2-3GB steady-state as old full-res files age out.
+
+---
+
+### 5. DB Write Contention ("database is locked")
+
+**Finding:** Three processes held the DB open concurrently:
+1. Collector daemon (`--collector-only`) — writer
+2. MCP server instance (Claude Desktop) — reader/writer
+3. Stray `.build/release/ActivityTracker` dev process — orphan
+
+**Root cause of locks:** SQLite WAL allows one writer at a time. Multiple connections contending → `SQLITE_BUSY` with no wait.
+
+**Fixes:**
+1. `PRAGMA busy_timeout=5000` — connections wait up to 5s instead of failing instantly. This is the idiomatic SQLite solution, not a band-aid.
+2. `PRAGMA synchronous=NORMAL` — faster writes.
+3. Killed the stray dev process (PID 74692).
+
+**Architecture discussion:** User asked if we need to re-architect the DB. Answer: no — 71MB single-user DB, ~1 write/5s is trivial for SQLite. busy_timeout is correct.
+
+---
+
+### 6. Hidden Double-Capture-Engine Bug (Critical)
+
+**Finding:** When Claude Desktop launched the MCP (`activity-tracker` with no flags), `main.swift` started **ALL subsystems** — capture engine, sync engine, audio capture, AND the MCP server. This meant a second full capture engine ran in parallel with the daemon, both writing to the DB.
+
+**Fix — proper mode separation:**
+- `--collector-only` (daemon): capture + sync + audio, read-write DB
+- No flags (MCP): MCP query server only, **read-only** DB — never captures or writes
+
+**Database read-only support:** `Database.init(config:readOnly:)` now uses `sqlite3_open_v2` with `SQLITE_OPEN_READONLY`, skips migrations, and doesn't create directories.
+
+---
+
+### 7. Commits This Session
+
+- `5562075` — Fix DB contention and screenshot bloat; MCP read-only mode
+
+---
+
+### 8. Current System State
+
+- **Daemon:** Stable, capturing via AX (tier1) + OCR fallback
+- **MCP:** Read-only query mode, no longer starts a second capture engine
+- **DB:** busy_timeout + synchronous=NORMAL, no more lock errors
+- **Screenshots:** Downscaled to ~1MB, purged 35GB → 19GB (settling to ~3GB)
+- **LibreWolf:** Now in tier1 polling with correct bundle ID
+
+### 9. Known Remaining Gaps (updated)
+
+1. **Full-screen capture still broken** — event-driven captures (heartbeat/app-switch) time out; need per-window capture fix
+2. **OCR nearly useless** — avg 12 chars; browser text not captured well
+3. **Startup backfill disabled** — run `make backfill` manually
+4. **No app exclusion list** — captures everything
+5. **VS Code chat harvester** — planned, not implemented
+6. **Claude Desktop needs restart** to pick up read-only MCP binary
