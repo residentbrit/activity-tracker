@@ -325,11 +325,14 @@ actor CaptureEngine {
             endedAt: nil,
             timezone: TimeZone.current.identifier
         )
+        // Set currentSession synchronously BEFORE the await so concurrent
+        // capture() calls see a non-nil session and don't create duplicates.
+        currentSession = session
         do {
             try await eventStore.insertSession(session)
-            currentSession = session
         } catch {
             log("[CaptureEngine] startNewSession failed: \(error)\n")
+            currentSession = nil
         }
     }
 

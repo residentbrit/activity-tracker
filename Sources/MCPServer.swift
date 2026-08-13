@@ -440,7 +440,7 @@ actor MCPServer {
         if machineId != nil {
             sql += " AND machine_id = ?"
         }
-        sql += " ORDER BY started_at DESC LIMIT 50"
+        sql += " ORDER BY started_at DESC LIMIT 200"
 
         var stmtPointer: OpaquePointer?
         guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
