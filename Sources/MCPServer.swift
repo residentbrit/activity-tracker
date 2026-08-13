@@ -146,6 +146,18 @@ actor MCPServer {
                 ]
             ],
             [
+                "name": "get_activity_range",
+                "description": "Get activity captured within a specific time range. Use this for 'what did I do between X and Y' queries. Timestamps are ISO 8601; if no timezone is given, local time is assumed.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "start": ["type": "string", "description": "Start time (ISO 8601, inclusive). e.g. '2026-08-12T08:00:00'"],
+                        "end": ["type": "string", "description": "End time (ISO 8601, exclusive). e.g. '2026-08-12T16:00:00'"],
+                        "limit": ["type": "integer", "description": "Max results (default 50, max 500)"]
+                    ]
+                ]
+            ],
+            [
                 "name": "get_sync_status",
                 "description": "Check sync status — how many events are pending push to homellm, and when the last sync occurred.",
                 "inputSchema": [
@@ -212,6 +224,12 @@ actor MCPServer {
         case "get_recent_activity":
             let minutes = arguments["minutes"] as? Int ?? 60
             return try await getRecentActivity(minutes: minutes)
+
+        case "get_activity_range":
+            let start = arguments["start"] as? String
+            let end = arguments["end"] as? String
+            let limit = arguments["limit"] as? Int ?? 50
+            return try await getActivityRange(start: start, end: end, limit: limit)
 
         case "get_sync_status":
             return await getSyncStatus()
@@ -328,6 +346,62 @@ actor MCPServer {
 
         if results.isEmpty {
             return "No activity recorded in the last \(minutes) minutes."
+        }
+
+        return prettyJSON(results)
+    }
+
+    /// Query activity within an arbitrary time range. Timestamps normalized to UTC before SQL comparison.
+    private func getActivityRange(start: String?, end: String?, limit: Int) async throws -> String {
+        let clampedLimit = min(max(limit, 1), 500)
+
+        var conditions: [String] = ["is_duplicate = 0"]
+        var params: [String] = []
+
+        if let start = start, let utc = normalizeToUTC(start) {
+            conditions.append("captured_at >= ?")
+            params.append(utc)
+        }
+        if let end = end, let utc = normalizeToUTC(end) {
+            conditions.append("captured_at < ?")
+            params.append(utc)
+        }
+
+        let sql = """
+            SELECT captured_at, trigger, app_name, window_title, source_type, text_content
+            FROM events
+            WHERE \(conditions.joined(separator: " AND "))
+            ORDER BY captured_at ASC
+            LIMIT \(clampedLimit)
+            """
+
+        var stmtPointer: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
+            throw ToolError.queryFailed
+        }
+        let stmt = stmtPointer!
+        defer { sqlite3_finalize(stmt) }
+
+        for (i, p) in params.enumerated() {
+            bindText(stmt, Int32(i + 1), p)
+        }
+
+        var results: [[String: Any]] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let capturedUTC = columnText(stmt, 0)
+            results.append([
+                "captured_at": capturedUTC,
+                "captured_at_local": localString(forUTC: capturedUTC),
+                "trigger": columnText(stmt, 1),
+                "app_name": columnTextOrNull(stmt, 2) ?? "",
+                "window_title": columnTextOrNull(stmt, 3) ?? "",
+                "source_type": columnText(stmt, 4),
+                "text": columnText(stmt, 5)
+            ])
+        }
+
+        if results.isEmpty {
+            return "No activity recorded in that time range."
         }
 
         return prettyJSON(results)
@@ -524,6 +598,64 @@ private func prettyJSON(_ object: Any) -> String {
         return ""
     }
     return text
+}
+
+// MARK: - Timestamp helpers
+
+/// Convert an ISO-ish timestamp string to a canonical UTC "YYYY-MM-DDTHH:MM:SSZ".
+/// Accepts with/without fractional seconds, with/without timezone (assumes local if absent).
+private func normalizeToUTC(_ input: String) -> String? {
+    let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    // ISO 8601 with fractional seconds
+    let f1 = ISO8601DateFormatter()
+    f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f1.date(from: trimmed) { return utcString(from: d) }
+
+    // ISO 8601 without fractional seconds
+    let f2 = ISO8601DateFormatter()
+    f2.formatOptions = [.withInternetDateTime]
+    if let d = f2.date(from: trimmed) { return utcString(from: d) }
+
+    // "YYYY-MM-DDTHH:mm:ss" — T separator, no timezone → local time
+    let fT = DateFormatter()
+    fT.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    fT.timeZone = TimeZone.current
+    if let d = fT.date(from: trimmed) { return utcString(from: d) }
+
+    // "YYYY-MM-DD HH:mm:ss" (local time)
+    let f3 = DateFormatter()
+    f3.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f3.timeZone = TimeZone.current
+    if let d = f3.date(from: trimmed) { return utcString(from: d) }
+
+    // "YYYY-MM-DD" (local date, midnight)
+    let f4 = DateFormatter()
+    f4.dateFormat = "yyyy-MM-dd"
+    f4.timeZone = TimeZone.current
+    if let d = f4.date(from: trimmed) { return utcString(from: d) }
+
+    return nil
+}
+
+private func utcString(from date: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    f.timeZone = TimeZone(secondsFromGMT: 0)
+    return f.string(from: date)
+}
+
+/// Convert a stored UTC "YYYY-MM-DDTHH:MM:SSZ" string to local-time "YYYY-MM-DDTHH:MM:SS".
+private func localString(forUTC utc: String) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    f.timeZone = TimeZone(secondsFromGMT: 0)
+    guard let date = f.date(from: utc) else { return utc }
+    let out = DateFormatter()
+    out.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    out.timeZone = TimeZone.current
+    return out.string(from: date)
 }
 
 enum ToolError: Error, LocalizedError {
