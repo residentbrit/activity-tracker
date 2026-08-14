@@ -39,6 +39,9 @@ all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 
 install: all
 	mkdir -p $(BIN_DIR) $(MODEL_DIR)
+	# Stop the daemon BEFORE replacing the binary — replacing a signed binary
+	# while it runs causes macOS to SIGKILL it ("Code Signature Invalid").
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist 2>/dev/null || true
 	cp $(BINARY) $(BIN_DIR)/activity-tracker
 	codesign --force --sign "ActivityTracker Dev" $(BIN_DIR)/activity-tracker 2>/dev/null || true
 	cp $(LLAMA_EMBED) $(BIN_DIR)/
