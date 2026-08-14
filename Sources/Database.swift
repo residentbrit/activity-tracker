@@ -30,6 +30,9 @@ final class Database {
         _ = try? execute("PRAGMA foreign_keys=ON")
         // Wait up to 5s on contention instead of failing with "database is locked"
         _ = try? execute("PRAGMA busy_timeout=5000")
+        // Disable memory-mapped I/O — macOS SQLite's purgeable mmap cache
+        // crashes (SIGSEGV in purgeableCacheFetch) and corrupts the DB.
+        _ = try? execute("PRAGMA mmap_size=0")
         if !readOnly {
             _ = try? execute("PRAGMA synchronous=NORMAL")
         }
