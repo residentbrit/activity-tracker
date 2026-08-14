@@ -1,5 +1,7 @@
 import Foundation
 import Cocoa
+import IOKit
+import IOKit.hidsystem
 
 /// Monitors macOS input events to drive capture triggers (D2).
 ///
@@ -210,18 +212,7 @@ final class InputMonitor: @unchecked Sendable {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
 
-            let keyIdle = CGEventSource.secondsSinceLastEventType(
-                .combinedSessionState, eventType: .keyDown
-            )
-            let clickIdle = CGEventSource.secondsSinceLastEventType(
-                .combinedSessionState, eventType: .leftMouseDown
-            )
-            let moveIdle = CGEventSource.secondsSinceLastEventType(
-                .combinedSessionState, eventType: .mouseMoved
-            )
-
-            // Any keyboard OR mouse activity (clicks AND movement) counts as active
-            let effectiveIdle = min(keyIdle, min(clickIdle, moveIdle))
+            let effectiveIdle = Self.systemIdleTime()
             let idleThreshold = Double(self.config.idleTimeoutMin * 60)
 
             if effectiveIdle >= idleThreshold {
@@ -237,6 +228,23 @@ final class InputMonitor: @unchecked Sendable {
         }
         timer.resume()
         self.idlePollTimer = timer
+    }
+
+    /// System-wide idle time in seconds via IOKit — the canonical macOS idle
+    /// source used by screensavers. Counts keyboard, mouse movement, clicks,
+    /// scroll — any HID activity. Returns a large value if unavailable.
+    private static func systemIdleTime() -> TimeInterval {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("IOHIDSystem")
+        )
+        guard service != 0 else { return 1_000_000 }
+        defer { IOObjectRelease(service) }
+        guard let prop = IORegistryEntryCreateCFProperty(
+            service, "HIDIdleTime" as CFString, kCFAllocatorDefault, 0
+        ) else { return 1_000_000 }
+        let ns = prop.takeRetainedValue() as? NSNumber
+        let nanos = ns?.doubleValue ?? 1_000_000_000_000_000
+        return nanos / 1_000_000_000.0
     }
 
     // MARK: - Window title polling
