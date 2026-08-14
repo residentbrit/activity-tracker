@@ -36,12 +36,20 @@ struct ActivityTracker {
         }
         log("database ready")
 
+        // Separate SQLite connections per subsystem. A single shared connection
+        // accessed concurrently from multiple actors corrupts macOS SQLite's
+        // purgeable page cache (SIGABRT in purgeableCacheUnpin). WAL mode +
+        // busy_timeout make multiple connections safe.
+        let captureDB = options.collectorOnly ? ((try? Database(config: config)) ?? db) : db
+        let syncDB    = options.collectorOnly ? ((try? Database(config: config)) ?? db) : db
+        let audioDB   = options.collectorOnly ? ((try? Database(config: config)) ?? db) : db
+
         // 3-6: create subsystems (don't start them yet)
         log("initializing subsystems…")
-        let captureEngine = CaptureEngine(config: config, database: db)
+        let captureEngine = CaptureEngine(config: config, database: captureDB)
         let mcpServer = MCPServer(database: db)
-        let syncEngine = SyncEngine(config: config, database: db)
-        let audioCapture = AudioCapture(config: config, database: db)
+        let syncEngine = SyncEngine(config: config, database: syncDB)
+        let audioCapture = AudioCapture(config: config, database: audioDB)
         log("subsystems ready")
 
         signal(SIGHUP, SIG_IGN)
