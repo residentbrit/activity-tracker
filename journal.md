@@ -412,3 +412,112 @@ Post-stabilization audit. Fixed the last architectural issues: DB write contenti
 4. **No app exclusion list** — captures everything
 5. **VS Code chat harvester** — planned, not implemented
 6. **Claude Desktop needs restart** to pick up read-only MCP binary
+
+---
+
+## 2026-08-13
+
+### Session Summary
+Fixed Claude's recurring "no activity" false reports. Root cause was two-fold: no MCP tool could express a time-of-day range, and `list_sessions` LIMIT 50 truncated to evening sessions only.
+
+---
+
+### 1. Added get_activity_range MCP Tool
+
+**Symptom:** Claude repeatedly reported "no activity from 8am-4pm" when data clearly existed (5,983 events on 8/12, every hour populated).
+
+**Root cause:** No MCP tool could express a time-of-day range:
+- `search_activities` — keyword only
+- `get_recent_activity` — "last N minutes" only (can't reach back to yesterday)
+- `list_sessions` — date filter only, no time-of-day
+
+**Fix:** New `get_activity_range` tool accepting `start`/`end` ISO timestamps. Normalizes to UTC, returns both `captured_at` (UTC) and `captured_at_local`. Also handles `T`-separated no-timezone input (assumes local time).
+
+**Commit:** `bf04038`
+
+---
+
+### 2. Session Churn Race (146 sessions/day)
+
+**Symptom:** 8/12 had 146 sessions (should be ~20). `list_sessions` LIMIT 50 showed only evening sessions, hiding the entire morning.
+
+**Root cause — concurrency race:** `capture()` checked `currentSession == nil` then called `await startNewSession()`. The await suspended the actor, allowing concurrent captures to also see `nil` and each create a session. Many sessions started at the exact same second.
+
+**Fix:** Set `currentSession` synchronously BEFORE the await in `startNewSession()`, so concurrent captures share one session. Also increased `list_sessions` LIMIT 50 → 200.
+
+**Note:** Claude's "sync theory" was wrong — MCP tools read the local SQLite directly; sync only affects homellm push.
+
+**Commit:** `f900dda`
+
+---
+
+## 2026-08-14
+
+### Session Summary
+Second DB corruption recovered; disabled SQLite mmap (root cause); fixed idle detection (IOKit); fixed the deploy workflow that was killing the daemon; reduced heartbeat frequency.
+
+---
+
+### 1. Second DB Corruption + mmap Root Cause
+
+**Symptom:** Events "storing" in logs but not persisting; latest event 6.5h stale. `PRAGMA integrity_check` → "database disk image is malformed".
+
+**Root cause:** Crash report showed SIGSEGV in SQLite's `purgeableCacheFetch → _platform_memset` — the macOS SQLite memory-mapped I/O path. Same crash class as the first corruption on 8/6.
+
+**Fixes:**
+1. Recovered 25,946 events + 437 sessions via `.recover` (nothing lost)
+2. `PRAGMA mmap_size=0` — forces normal page cache, avoids the crash-prone purgeable mmap path entirely
+
+**Commit:** `91c293b`
+
+---
+
+### 2. Idle Detection Fix (IOKit)
+
+**Symptom:** Tracker kept capturing while user away. `CGEventSource.secondsSinceLastEventType(.mouseMoved)` returned a constant small value, so idle never fired.
+
+**Root cause:** The `mouseMoved` event type is unreliable in `secondsSinceLastEventType`. Earlier fix attempt (8/12) also missed mouse movement entirely.
+
+**Fix:** Switched to IOKit `HIDIdleTime` (`IOHIDSystem` registry property) — the canonical screensaver-grade idle source that counts keys, clicks, scroll, and cursor movement in one value. Also handles wake-from-idle by firing a capture on activity resume.
+
+**Commit:** `11d6bec`
+
+---
+
+### 3. "Code Signature Invalid" Kill — Deploy Workflow Bug
+
+**Symptom:** Recurring "background item added" popups and tracker "stopping." 
+
+**Root cause:** Replacing the signed binary (`cp` + `codesign`) while the daemon ran caused macOS to SIGKILL the process with "Code Signature Invalid" (in-memory pages no longer matched on-disk signature). launchd restarted it → popup. This happened on every deploy.
+
+**Fix:** `make install` now unloads the daemon BEFORE replacing the binary. Safe workflow: stop → replace → sign → start.
+
+**Commit:** `65c1549`
+
+---
+
+### 4. Heartbeat Frequency Reduction
+
+**Finding:** `heartbeatIntervalSec` had been set to 5 (from default 30) — full screenshot every 5s while active.
+
+**Fix:** Set to 15s in config (user choice). Confirmed ~3 heartbeats/35s after change.
+
+---
+
+### 5. Commits This Session
+
+- `91c293b` — Disable SQLite mmap
+- `242a54b` — Fix idle detection (mouse movement) — *superseded by IOKit fix*
+- `11d6bec` — Replace CGEventSource idle polling with IOKit HIDIdleTime
+- `65c1549` — Unload daemon before replacing binary in make install
+
+---
+
+### 6. Key Lessons Learned (cumulative)
+
+1. **Never replace a signed binary while it runs** — macOS kills it with "Code Signature Invalid"
+2. **SQLite mmap is crash-prone on macOS** — always `PRAGMA mmap_size=0`
+3. **`CGEventSource.secondsSinceLastEventType(.mouseMoved)` is unreliable** — use IOKit HIDIdleTime for idle detection
+4. **Actor + await = race window** — set state synchronously before awaiting
+5. **Diagnostic SQL must wrap timestamps in `datetime()`** — raw string comparison of `T`-separated vs space-separated ISO strings is wrong
+6. **MCP tools read local DB directly** — sync status is irrelevant to queryability
