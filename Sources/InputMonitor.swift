@@ -210,19 +210,29 @@ final class InputMonitor: @unchecked Sendable {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
 
-            let idleSeconds = CGEventSource.secondsSinceLastEventType(
-                .hidSystemState, eventType: .keyDown
+            let keyIdle = CGEventSource.secondsSinceLastEventType(
+                .combinedSessionState, eventType: .keyDown
             )
-            let mouseIdle = CGEventSource.secondsSinceLastEventType(
-                .hidSystemState, eventType: .leftMouseDown
+            let clickIdle = CGEventSource.secondsSinceLastEventType(
+                .combinedSessionState, eventType: .leftMouseDown
+            )
+            let moveIdle = CGEventSource.secondsSinceLastEventType(
+                .combinedSessionState, eventType: .mouseMoved
             )
 
-            let effectiveIdle = min(idleSeconds, mouseIdle)
+            // Any keyboard OR mouse activity (clicks AND movement) counts as active
+            let effectiveIdle = min(keyIdle, min(clickIdle, moveIdle))
             let idleThreshold = Double(self.config.idleTimeoutMin * 60)
 
-            if effectiveIdle >= idleThreshold && !self.isIdle {
-                self.isIdle = true
-                self.onEvent?(.idleTimeout)
+            if effectiveIdle >= idleThreshold {
+                if !self.isIdle {
+                    self.isIdle = true
+                    self.onEvent?(.idleTimeout)
+                }
+            } else if self.isIdle {
+                // Activity resumed — wake and trigger a capture
+                self.isIdle = false
+                self.onEvent?(.appSwitch)
             }
         }
         timer.resume()
