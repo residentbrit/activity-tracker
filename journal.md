@@ -521,3 +521,39 @@ Second DB corruption recovered; disabled SQLite mmap (root cause); fixed idle de
 4. **Actor + await = race window** — set state synchronously before awaiting
 5. **Diagnostic SQL must wrap timestamps in `datetime()`** — raw string comparison of `T`-separated vs space-separated ISO strings is wrong
 6. **MCP tools read local DB directly** — sync status is irrelevant to queryability
+
+---
+
+## 2026-08-17
+
+### Session Summary
+Fixed a total capture stall caused by AX-extraction thread pile-up. The 3s AX timeout abandoned callers but never cancelled the blocking `AXUIElementCopyAttributeValue` calls, so each timed-out extraction leaked a permanently-blocked GCD thread. Over hours these accumulated until the global thread pool was exhausted and the whole pipeline stalled.
+
+---
+
+### 1. AX Thread Pile-Up (capture stall)
+
+**Symptom:** Daemon alive but last persisted event ~40min stale. `capture(heartbeat) starting` logged with no completion. Tier1 polls running at ~3min intervals instead of 5s.
+
+**Diagnosis:**
+- `sample` of the daemon: 452/1021 samples stuck in `AXUIElementCopyAttributeValue` → `_AXMIGCopyAttributeValue` → `mach_msg` (window-server IPC), spread across dozens of `com.apple.root.user-initiated-qos` threads
+- 1,036 "AX extraction timed out" log lines
+- Root cause: `extractViaAX` spawned each AX walk on a fresh `DispatchQueue.global(qos: .userInitiated)` thread. The 3s semaphore timeout resumed the caller (fall back to OCR) but **did not cancel the blocking AX call** — the abandoned thread stayed stuck in window-server IPC forever
+- Feedback loop: stuck AX threads exhausted the GCD user-initiated pool → new timeout waiters and `captureScreen()` couldn't get scheduled → `processEvent` hung → serial `extractionQueue` blocked → no events persisted
+
+**Fix (`Sources/TextExtractor.swift`):**
+- Dedicated **serial** AX queue (`activity-tracker.ax`) — all AX walks run on one thread
+- Non-blocking `axGate` semaphore (capacity 1) — if an AX walk is still stuck, skip AX and fall straight to OCR instead of piling up another blocked thread
+- Dedicated concurrent OCR queue (`activity-tracker.ocr`) + `ocrGate` (capacity 2) to bound Vision concurrency
+- Timeout waiters moved to `DispatchQueue.global(qos: .utility)` so they don't contend with the user-initiated pool
+
+**Result:** Bounded stuck AX calls to at most one; captures resumed immediately after redeploy.
+
+**Commit:** *(this session)*
+
+---
+
+### 2. Key Lesson
+
+- **A timeout that abandons a blocking call without cancelling it leaks the thread** — on APIs like `AXUIElementCopyAttributeValue` that can block in kernel IPC, you must bound concurrency (gate/serial queue), not just time out the caller.
+

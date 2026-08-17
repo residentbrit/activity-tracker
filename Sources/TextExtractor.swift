@@ -8,6 +8,27 @@ import Cocoa
 /// Not an actor — extractions run concurrently on GCD threads, one per capture.
 final class TextExtractor: Sendable {
 
+    /// Dedicated serial queue for AX extraction. An AX call blocked in
+    /// window-server IPC cannot be cancelled; running all AX work on one queue
+    /// bounds the damage to a single stuck thread instead of one per capture.
+    private static let axQueue = DispatchQueue(
+        label: "activity-tracker.ax", qos: .userInitiated)
+
+    /// Held while the AX worker is busy. Acquired non-blockingly: if a previous
+    /// AX extraction is still stuck, we skip AX and fall back to OCR instead of
+    /// piling up another blocked GCD thread (which eventually exhausts the
+    /// global thread pool and stalls the whole capture pipeline).
+    private static let axGate = DispatchSemaphore(value: 1)
+
+    /// Dedicated concurrent queue for OCR (Vision). Vision requests are bounded
+    /// but still CPU-heavy; capping concurrency avoids thread-pool exhaustion.
+    private static let ocrQueue = DispatchQueue(
+        label: "activity-tracker.ocr", qos: .userInitiated, attributes: .concurrent)
+
+    /// Bounds concurrent Vision requests (they can each block a thread while
+    /// the Vision framework does its own internal scheduling).
+    private static let ocrGate = DispatchSemaphore(value: 2)
+
     struct ExtractionResult {
         let text: String
         let source: SourceType
@@ -38,6 +59,13 @@ final class TextExtractor: Sendable {
     // MARK: - Accessibility (AXUIElement)
 
     private func extractViaAX(bundleID: String?) async -> String? {
+        // Circuit breaker: if the AX worker is still busy (a previous call is
+        // stuck in window-server IPC), skip AX and fall back to OCR instead of
+        // piling up another blocked thread.
+        guard Self.axGate.wait(timeout: .now()) == .success else {
+            return nil
+        }
+
         let app: NSRunningApplication?
         if let bundleID {
             app = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == bundleID }
@@ -45,18 +73,26 @@ final class TextExtractor: Sendable {
         } else {
             app = NSWorkspace.shared.frontmostApplication
         }
-        guard let targetApp = app else { return nil }
+        guard let targetApp = app else {
+            Self.axGate.signal()
+            return nil
+        }
         let pid = targetApp.processIdentifier
 
-        // Run ALL AX calls on a background thread — any AX call can block indefinitely
+        // Run ALL AX calls on the dedicated AX thread — any AX call can block
+        // indefinitely. The timeout waiter runs on the utility pool (never on
+        // the contended user-initiated pool).
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
             var result: String? = nil
-            DispatchQueue.global(qos: .userInitiated).async {
+
+            Self.axQueue.async {
+                defer { Self.axGate.signal() }
                 let appRef = AXUIElementCreateApplication(pid)
                 var focusedWindow: CFTypeRef?
                 guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
                       let window = focusedWindow else {
+                    result = nil
                     sem.signal()
                     return
                 }
@@ -65,7 +101,8 @@ final class TextExtractor: Sendable {
                 result = allText.joined(separator: "\n")
                 sem.signal()
             }
-            DispatchQueue.global(qos: .userInitiated).async {
+
+            DispatchQueue.global(qos: .utility).async {
                 if sem.wait(timeout: .now() + 3) == .timedOut {
                     log("[TextExtractor] AX extraction timed out — falling back to OCR\n")
                 }
@@ -113,11 +150,18 @@ final class TextExtractor: Sendable {
     // MARK: - Vision OCR
 
     private func extractViaOCR(image: CGImage) async -> String? {
-        // sem.wait() runs on DispatchQueue to avoid blocking Swift concurrency threads
+        // Bound concurrent Vision requests to avoid piling up blocked threads.
+        guard Self.ocrGate.wait(timeout: .now()) == .success else {
+            return nil
+        }
+
+        // sem.wait() runs on the utility pool to avoid blocking Swift
+        // concurrency threads or the contended user-initiated pool.
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
             var ocrResult: String? = nil
-            DispatchQueue.global(qos: .userInitiated).async {
+            Self.ocrQueue.async {
+                defer { Self.ocrGate.signal() }
                 let request = VNRecognizeTextRequest { request, error in
                     if error == nil,
                        let observations = request.results as? [VNRecognizedTextObservation] {
@@ -131,7 +175,7 @@ final class TextExtractor: Sendable {
                 let handler = VNImageRequestHandler(cgImage: image, options: [:])
                 try? handler.perform([request])
             }
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .utility).async {
                 if sem.wait(timeout: .now() + 8) == .timedOut {
                     log("[TextExtractor] OCR timed out\n")
                 }
