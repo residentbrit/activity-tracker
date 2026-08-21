@@ -178,6 +178,20 @@ def run(cfg: BackfillConfig) -> int:
             continue
 
         blob, err = embed_json(prepared, cfg)
+        if blob is None and err == "rc:-6":
+            # llama-embedding SIGABRTs when the tokenized input exceeds its
+            # batch size. Token count is a poor match for word count on
+            # token-dense text (ID/hostname lists), so shrink progressively
+            # until it fits.
+            word_count = len(prepared.split())
+            for words_cap in (100, 60, 30, 15):
+                if words_cap >= word_count:
+                    continue
+                prepared = prepare_text(prepared, cfg.max_chars, words_cap)
+                blob, err = embed_json(prepared, cfg)
+                if blob is not None or err != "rc:-6":
+                    break
+
         if blob is None:
             failed += 1
             print(f"[{idx}/{total}] {event_id} failed {err}")
