@@ -29,7 +29,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install
+.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install harvest-chat harvest-install harvest-embed
 
 all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 	@echo ""
@@ -71,8 +71,10 @@ daemon-install: install
 daemon-uninstall:
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist || true
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist || true
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist || true
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist
+	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist
 	@echo "==> Daemons stopped and removed"
 
 embedserver-install: install
@@ -95,6 +97,24 @@ migrate-screenpipe:
 
 migrate-screenpipe-embed:
 	./scripts/backfill_embeddings.py --trigger screenpipe_import
+
+# --- VS Code Copilot Chat harvest ---
+
+harvest-chat:
+	/usr/bin/python3 scripts/harvest_vscode_chat.py
+
+harvest-embed:
+	./scripts/backfill_embeddings.py --trigger copilot_chat_import
+
+harvest-install:
+	mkdir -p $(HOME)/.local/share/activity-tracker/logs
+	sed 's|%HOME%|$(HOME)|g' launchd/com.activitytracker.harvest.plist > $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist 2>/dev/null || true
+	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist
+	@echo ""
+	@echo "==> Chat harvest job installed (runs hourly)"
+	@echo "    Manual run:  make harvest-chat"
+	@echo "    Embed after: make harvest-embed"
 
 # --- Swift binary ---
 
