@@ -604,3 +604,55 @@ Decode ~19.2 tok/s (~65% of the ~30 tok/s M4 Pro bandwidth ceiling). Chose 16,38
 
 - None — two temp scripts left untracked in repo root.
 
+---
+
+## 2026-08-21
+
+### Session Summary
+Implemented the VS Code Copilot Chat harvester (planned since 2026-08-05). Harvests chat transcripts into the activity DB as `copilot_chat` events, linked by timestamp to screen-capture context. Decision: transcripts only (not debug logs), as a Python script + hourly launchd job rather than a Swift in-daemon worker.
+
+---
+
+### 1. Source Evaluation: Transcripts vs Debug Logs
+
+- **Transcripts** (`workspaceStorage/*/GitHub.copilot-chat/transcripts/*.jsonl`, 91 files) are a full event stream: `session.start`, `user.message`, `assistant.message` (content + `toolRequests` + `reasoningText`), `assistant.turn_start/end`, `tool.execution_start/complete`. Producer is always `copilot-agent`. This is the "what & why" layer — sufficient for work-context reconstruction.
+- **Debug logs** (`debug-logs/<session>/…`, 1,228 files) are OpenTelemetry-style span traces (`ts`, `dur`, `sid`, `spanId`, `status`, `attrs`) — the "how" layer (per-span timing, failures, model + token counts). Deferred as optional future enrichment.
+- **Verdict:** transcripts alone are sufficient; debug logs add little for the stated goal.
+
+### 2. Harvester Implementation
+
+- `scripts/harvest_vscode_chat.py` — pairs each `user.message` with the assistant prose that follows it (sequential turn pairing); if a transcript has no `user.message`, emits one event per transcript from the assistant content. Fields:
+  - `source_type = copilot_chat`, `trigger = copilot_chat_import`
+  - `window_title` = workspace name (resolved from `workspace.json` folder URI)
+  - `text_content` = `Prompt: …\nResponse: …` (capped at 1200 chars each)
+  - synthetic daily sessions (`vc_` prefix), dedup via `dedup_key = vc_<md5(session+message-id)>`
+  - inserts unembedded; embedding is a separate step
+- `launchd/com.activitytracker.harvest.plist` — `StartInterval=3600`
+- Makefile targets: `harvest-chat`, `harvest-embed`, `harvest-install`; harvest added to `daemon-uninstall`
+
+**Why Python + launchd instead of a Swift worker or cron:**
+- Scraping/JSON munging is Python's sweet spot; Swift would be verbose.
+- Avoids the daemon rebuild → re-sign → TCC re-grant pain on every harvester tweak.
+- macOS cron is unreliable when the machine sleeps; launchd `StartInterval` is the native, reliable equivalent, and the repo already uses launchd plists.
+
+### 3. Initial Import + Embedding
+
+- Import: **984 events** from 91 transcripts, **45** synthetic daily sessions. Idempotent (re-run skipped all 984).
+- Embedding via `make harvest-embed`: 979/984 succeeded, 5 failed with `rc:-6` (SIGABRT).
+
+**Root cause of the 5 failures:** `llama-embedding` SIGABRTs (`GGML_ASSERT(i01 >= 0 && i01 < ne01)` in `ggml_compute_forward_get_rows`) when the tokenized input exceeds its 512-token batch limit. The 5 texts are token-dense lists (space-separated SIDs/hostnames), where ~200 words → ~550 tokens. This corrects the earlier assumption that `rc:-6` meant corrupted text.
+
+**Fix (`scripts/backfill_embeddings.py`):** on `rc:-6`, retry with progressively shorter input (100 → 60 → 30 → 15 words). First attempt of the retry loop broke early when the text was already shorter than the first cap; fixed to skip caps that don't actually shrink the text.
+
+**Result:** 984/984 chat events embedded.
+
+### 4. Commits This Session
+
+- `b4cce7c` — Add VS Code Copilot Chat transcript harvester (script + hourly launchd job)
+- `7100e0d` — Retry embedding with shorter text on SIGABRT
+
+### 5. Key Lessons
+
+- **`rc:-6` from llama-embedding = token-count overflow, not corrupted text** — token-dense input (ID/hostname lists) exceeds the 512-token batch; word count is a poor proxy for token count. Retry with shrinking input.
+- **Transcripts carry tool calls + reasoning, not just prompts** — richer than the original journal plan assumed.
+
