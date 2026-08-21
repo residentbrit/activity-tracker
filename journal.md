@@ -531,12 +531,13 @@ Fixed a total capture stall caused by AX-extraction thread pile-up. The 3s AX ti
 
 ---
 
-### 1. AX Thread Pile-Up (capture stall)
+### 1. AX Thread Pil be-Up (capture stall)
 
 **Symptom:** Daemon alive but last persisted event ~40min stale. `capture(heartbeat) starting` logged with no completion. Tier1 polls running at ~3min intervals instead of 5s.
 
 **Diagnosis:**
 - `sample` of the daemon: 452/1021 samples stuck in `AXUIElementCopyAttributeValue` → `_AXMIGCopyAttributeValue` → `mach_msg` (window-server IPC), spread across dozens of `com.apple.root.user-initiated-qos` threads
+
 - 1,036 "AX extraction timed out" log lines
 - Root cause: `extractViaAX` spawned each AX walk on a fresh `DispatchQueue.global(qos: .userInitiated)` thread. The 3s semaphore timeout resumed the caller (fall back to OCR) but **did not cancel the blocking AX call** — the abandoned thread stayed stuck in window-server IPC forever
 - Feedback loop: stuck AX threads exhausted the GCD user-initiated pool → new timeout waiters and `captureScreen()` couldn't get scheduled → `processEvent` hung → serial `extractionQueue` blocked → no events persisted
@@ -549,11 +550,57 @@ Fixed a total capture stall caused by AX-extraction thread pile-up. The 3s AX ti
 
 **Result:** Bounded stuck AX calls to at most one; captures resumed immediately after redeploy.
 
-**Commit:** *(this session)*
+**Commit:** `63a8b3d`
 
 ---
 
 ### 2. Key Lesson
 
 - **A timeout that abandons a blocking call without cancelling it leaks the thread** — on APIs like `AXUIElementCopyAttributeValue` that can block in kernel IPC, you must bound concurrency (gate/serial queue), not just time out the caller.
+
+---
+
+## 2026-08-18
+
+### Session Summary
+Explored using Ollama + qwen3:14b to scan Obsidian project `.md` files and report which are still in progress, comparing Obsidian-plugin performance against a terminal script. No code committed — produced two temporary untracked test scripts in the repo root.
+
+---
+
+### 1. Ollama / qwen3:14b Project-Scan Test
+
+**Goal:** Have a local model read `~/Library/CloudStorage/Dropbox/OBSIDIAN/Projects/*.md` and report which projects are still in progress (status != done/canceled), to compare Obsidian vs terminal performance.
+
+**Environment:** Ollama 0.24.0 on Apple M4 Pro (48GB). Models present: `qwen3:14b` (14.8B, Q4_K_M, 40,960 ctx, thinking mode) and `qwen2.5-coder:14b`.
+
+**Work:**
+- Confirmed Ollama is a model runner, not a file scanner — no native file-read. qwen3 exposes a `tools` capability (tool calling), which is the path to file access.
+- Created two temporary scripts (both untracked, not committed):
+  - `scan_projects_ollama.py` — explicit classification with timing (model load, TTFT, throughput)
+  - `scan_projects_reasoning.py` — reasoning test: raw `.md` files with NO instructions; model must infer file semantics, how status is recorded, and collate not-done projects
+
+**Hang / cold-load:** First run hung for 2+ minutes with no response. Not a bug — cold model load. After an Ollama upgrade the model ran 100% GPU (11GB, 32,768 ctx).
+
+**Cold vs warm benchmark (7,610-token prompt):**
+
+| Metric | Cold | Warm |
+|---|---|---|
+| Model load | 1.93 s | 0.11 s |
+| Prompt ingest | 41.5 s (183 tok/s) | 0.07 s |
+| First answer token | 95.3 s | 51.2 s |
+| Wall clock total | 116.8 s | 72.6 s |
+
+Decode ~19.2 tok/s (~65% of the ~30 tok/s M4 Pro bandwidth ceiling). Chose 16,384 context window for the test.
+
+---
+
+### 2. Key Lesson
+
+- **Local model "no response" is often a cold load** — first prompt ingest on a fresh model is ~40s for ~7.6k tokens. Check `ollama ps` for load state before assuming a hang.
+
+---
+
+### Commits This Session
+
+- None — two temp scripts left untracked in repo root.
 
