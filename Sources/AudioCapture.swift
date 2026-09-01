@@ -23,6 +23,7 @@ actor AudioCapture {
     private var currentMeetingSession: Session?
     private var audioEngine: AVAudioEngine?
     private var speechSegments: [Data] = []  // Raw PCM chunks that passed VAD
+    private var peakRMS: Double = 0          // Diagnostic: loudest level seen this meeting
 
     /// Poll meeting state every 5 seconds.
     private var pollTask: Task<Void, Never>?
@@ -85,6 +86,7 @@ actor AudioCapture {
         currentMeetingApp = meetingDetector.currentMeetingApp()
         meetingStartTime = Date()
         speechSegments = []
+        peakRMS = 0
 
         let session = Session(
             id: UUID().uuidString,
@@ -115,7 +117,7 @@ actor AudioCapture {
         audioEngine = nil
 
         let endedAt = ISO8601DateFormatter().string(from: Date())
-        log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments\n")
+        log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments, peak RMS \(String(format: "%.0f", peakRMS))\n")
 
         if var session = currentMeetingSession {
             session.endedAt = endedAt
@@ -199,14 +201,24 @@ actor AudioCapture {
         if vadDetect(samples) {
             speechSegments.append(pcmData)
         }
+        // Track the loudest chunk for diagnostics — lets us distinguish
+        // "mic delivered silence" from "VAD threshold too high".
+        if let rms = rmsLevel(samples), rms > peakRMS {
+            peakRMS = rms
+        }
     }
 
     /// Simple energy-based VAD. Returns true if RMS exceeds threshold.
     private func vadDetect(_ samples: [Int16]) -> Bool {
         guard samples.count > 0 else { return false }
         let threshold: Double = 500.0
+        return (rmsLevel(samples) ?? 0) > threshold
+    }
+
+    private func rmsLevel(_ samples: [Int16]) -> Double? {
+        guard samples.count > 0 else { return nil }
         let sumSq = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
-        return sqrt(sumSq / Double(samples.count)) > threshold
+        return sqrt(sumSq / Double(samples.count))
     }
 
     // MARK: - Transcription (whisper.cpp subprocess)

@@ -656,3 +656,47 @@ Implemented the VS Code Copilot Chat harvester (planned since 2026-08-05). Harve
 - **`rc:-6` from llama-embedding = token-count overflow, not corrupted text** — token-dense input (ID/hostname lists) exceeds the 512-token batch; word count is a poor proxy for token count. Retry with shrinking input.
 - **Transcripts carry tool calls + reasoning, not just prompts** — richer than the original journal plan assumed.
 
+---
+
+## 2026-09-01
+
+### Session Summary
+Audio capture audit. Found meetings were never detected because the config listed the old Teams bundle ID (`com.microsoft.teams`), but the machine runs the new Teams client (`com.microsoft.teams2`). Added the new ID, confirmed mic permission is granted, and added a peak-RMS diagnostic to settle whether the mic tap actually delivers audio.
+
+---
+
+### 1. Meetings Not Detected (New Teams Bundle ID)
+
+**Symptom:** User had meetings today; `audio_segments` table still empty (0 rows ever).
+
+**Findings:**
+- Events show `com.microsoft.teams2` frontmost 75× today — the user is on **new Microsoft Teams** (2.0)
+- Config `meetingBundleIDs` contained `com.microsoft.teams` (classic), which is **not installed** on this machine (`mdfind` → NOT FOUND)
+- So `MeetingDetector.isMeetingActive()` never matched during Teams calls
+- The only two meeting detections in the whole log history (8/10 Slack huddle, 9/1 LibreWolf "huddle" title) both ended with **0 speech segments**
+
+**Fix:**
+- Added `com.microsoft.teams2` to `meetingBundleIDs` in both `~/.config/activity-tracker/config.json` and `Sources/Resources/config.default.json`
+- Reloaded the running daemon via SIGHUP (config reload confirmed in logs)
+
+**Mic permission check:** TCC `kTCCServiceMicrophone` for `/Users/phillip/.local/bin/activity-tracker` is `auth_value=2` (ALLOWED) — permission is NOT the blocker.
+
+### 2. Peak-RMS Diagnostic
+
+**Why:** The two prior meeting detections both produced 0 speech segments with no error logged, so it's unclear whether the AVAudioEngine mic tap delivers real audio or silence.
+
+**Change (`Sources/AudioCapture.swift`):**
+- Track `peakRMS` (loudest chunk RMS) per meeting
+- Refactored VAD to share a `rmsLevel()` helper
+- `endMeeting()` now logs `peak RMS` alongside segment count
+
+**Interpretation next meeting:**
+- `peak RMS ≈ 0` → mic tap delivers silence (tap format/permission issue)
+- `peak RMS` high but 0 segments → VAD threshold (500) too high
+- Both nonzero → transcription is the next thing to verify
+
+### 3. Commit
+
+- *(this session)* — Add `com.microsoft.teams2` to meeting bundle IDs + peak-RMS diagnostic
+
+

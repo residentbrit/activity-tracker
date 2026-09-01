@@ -5,6 +5,7 @@
   "audioMode": "meetings_only",
   "meetingBundleIDs": [
     "com.microsoft.teams",
+    "com.microsoft.teams2",
     "com.tinyspeck.slackmacgap",
     "us.zoom.xos"
   ],
