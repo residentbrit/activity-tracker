@@ -24,6 +24,7 @@ actor AudioCapture {
     private var audioEngine: AVAudioEngine?
     private var speechSegments: [Data] = []  // Raw PCM chunks that passed VAD
     private var peakRMS: Double = 0          // Diagnostic: loudest level seen this meeting
+    private var audioSampleRate: Double = 16000  // Mic native sample rate, set at engine start
 
     /// Poll meeting state every 5 seconds.
     private var pollTask: Task<Void, Never>?
@@ -119,41 +120,41 @@ actor AudioCapture {
         let endedAt = ISO8601DateFormatter().string(from: Date())
         log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments, peak RMS \(String(format: "%.0f", peakRMS))\n")
 
-        if var session = currentMeetingSession {
-            session.endedAt = endedAt
-            try? await eventStore.updateSession(session)
-        }
-
-        guard !speechSegments.isEmpty else {
-            currentMeetingApp = nil
-            meetingStartTime = nil
-            return
-        }
-
-        // Concatenate all speech segments for transcription
+        // Snapshot meeting state into locals and clear actor state BEFORE any
+        // await. Meetings flap (frontmost app changes every few seconds), so a
+        // new meeting can start while this one is still transcribing; using
+        // locals prevents the delayed resume from clobbering the new meeting.
+        let session = currentMeetingSession
+        let meetingApp = currentMeetingApp
         let fullAudio = speechSegments.reduce(into: Data()) { $0.append($1) }
-
-        // Transcribe (TODO: whisper.cpp — placeholder for now)
-        let transcript = await transcribeAudio(fullAudio)
-
-        // Store in DB, discard raw audio
-        if let transcript, !transcript.isEmpty, let sessionId = currentMeetingSession?.id {
-            let embedding = await embedder.embed(transcript)
-            try? await eventStore.insertAudioSegment(
-                id: UUID().uuidString,
-            sessionId: sessionId,
-                startedAt: ISO8601DateFormatter().string(from: startTime),
-                endedAt: endedAt,
-                meetingApp: currentMeetingApp,
-                transcript: transcript,
-                embedding: embedding
-            )
-        }
 
         currentMeetingApp = nil
         meetingStartTime = nil
         currentMeetingSession = nil
         speechSegments = []
+        peakRMS = 0
+
+        if var session {
+            session.endedAt = endedAt
+            try? await eventStore.updateSession(session)
+        }
+
+        guard !fullAudio.isEmpty else { return }
+
+        // Transcribe via whisper.cpp, then store transcript + embedding.
+        let transcript = await transcribeAudio(fullAudio)
+        guard let transcript, !transcript.isEmpty, let sessionId = session?.id else { return }
+
+        let embedding = await embedder.embed(transcript)
+        try? await eventStore.insertAudioSegment(
+            id: UUID().uuidString,
+            sessionId: sessionId,
+            startedAt: ISO8601DateFormatter().string(from: startTime),
+            endedAt: endedAt,
+            meetingApp: meetingApp,
+            transcript: transcript,
+            embedding: embedding
+        )
     }
 
     // MARK: - AVAudioEngine setup
@@ -162,9 +163,13 @@ actor AudioCapture {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
 
-        // Tap the mic input in its native format.
-        // Conversion to 16kHz mono happens before whisper.cpp, not here.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+        // Tap the mic input in its native format. Record the real sample rate
+        // so the WAV header written for whisper.cpp matches the actual PCM data.
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        self.audioSampleRate = inputFormat.sampleRate
+        log("[AudioCapture] mic format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch\n")
+
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
             let frameLength = buffer.frameLength
             let sampleCount = Int(frameLength)
@@ -227,15 +232,16 @@ actor AudioCapture {
     /// Writes PCM data to a temp WAV file, runs whisper-cli, returns transcript.
     private nonisolated func transcribeAudio(_ audioData: Data) async -> String? {
         let config = await self.config
+        let sampleRate = await self.audioSampleRate
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                let result = Self.runWhisper(audioData, config: config)
+                let result = Self.runWhisper(audioData, config: config, sampleRate: sampleRate)
                 continuation.resume(returning: result)
             }
         }
     }
 
-    private static func runWhisper(_ audioData: Data, config: Config) -> String? {
+    private static func runWhisper(_ audioData: Data, config: Config, sampleRate: Double) -> String? {
         // Check binary availability
         guard FileManager.default.isExecutableFile(atPath: config.whisperBinaryPath) else {
             log("[AudioCapture] ⚠️ whisper-cli not found at \(config.whisperBinaryPath)\n")
@@ -245,7 +251,7 @@ actor AudioCapture {
         // Write audio to temp WAV file
         let tempDir = FileManager.default.temporaryDirectory
         let wavFile = tempDir.appendingPathComponent("whisper-input-\(UUID().uuidString).wav")
-        guard writeWAV(audioData, to: wavFile) else {
+        guard writeWAV(audioData, to: wavFile, sampleRate: sampleRate) else {
             log("[AudioCapture] failed to write WAV\n")
             return nil
         }
@@ -294,9 +300,9 @@ actor AudioCapture {
         return transcript
     }
 
-    /// Write raw Int16 PCM data as a minimal WAV file.
-    private static func writeWAV(_ pcmData: Data, to url: URL) -> Bool {
-        let sampleRate: UInt32 = 16000
+    /// Write raw Int16 PCM data as a minimal WAV file at the given sample rate.
+    private static func writeWAV(_ pcmData: Data, to url: URL, sampleRate: Double) -> Bool {
+        let sampleRate: UInt32 = UInt32(sampleRate.rounded())
         let bitsPerSample: UInt16 = 16
         let numChannels: UInt16 = 1
         let byteRate = sampleRate * UInt32(numChannels) * UInt32(bitsPerSample / 8)

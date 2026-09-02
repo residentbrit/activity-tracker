@@ -699,4 +699,36 @@ Audio capture audit. Found meetings were never detected because the config liste
 
 - *(this session)* — Add `com.microsoft.teams2` to meeting bundle IDs + peak-RMS diagnostic
 
+---
+
+## 2026-09-02
+
+### Session Summary
+Meetings are now detected and audio flows (peak RMS up to 13k), but nothing was being stored. Fixed two bugs: a WAV sample-rate mismatch that made whisper transcribe at the wrong speed, and a meeting-flapping race that clobbered state mid-transcription.
+
+---
+
+### 1. Meetings Detected, Audio Flowing, Zero Stored
+
+**Symptom:** `meeting started (com.microsoft.teams2)` fires repeatedly and `meeting ended, N speech segments, peak RMS X` shows real audio (RMS 500–13,000), yet `audio_segments` stays at 0 rows and there are no whisper error logs.
+
+**Root cause — WAV sample-rate mismatch (`writeWAV`):**
+- The AVAudioEngine tap runs at the mic's **native** sample rate (44.1/48 kHz), but `writeWAV` hardcoded `sampleRate = 16000`
+- whisper-cli read the 48 kHz PCM as 16 kHz → audio played ~3× too slow → garbage/empty transcript → `insertAudioSegment` never called (and empty-transcript path logs nothing)
+
+**Root cause — meeting-flapping race (`endMeeting`):**
+- Teams becomes frontmost/loses frontmost every few seconds, so meetings start and end rapidly
+- `endMeeting()` awaited `transcribeAudio` (10–30s) before clearing state, then read `currentMeetingSession?.id` and `currentMeetingApp` *after* the await
+- A new `startMeeting()` could run during that await and replace the session/app; the delayed resume then inserted the old transcript under the **new** session id and clobbered the new meeting's state (nil-ing `meetingStartTime`/`currentMeetingSession`), so the next meeting was never transcribed
+
+**Fixes (`Sources/AudioCapture.swift`):**
+1. Capture the real sample rate at engine setup (`inputNode.outputFormat(forBus: 0).sampleRate`) and write it into the WAV header; log the mic format at meeting start
+2. Rewrote `endMeeting` to snapshot `session`, `meetingApp`, and `fullAudio` into locals and clear actor state **before** any `await`, so a delayed transcription can't clobber a newer meeting
+3. whisper-cli resamples internally, so writing the correct rate is sufficient — no explicit 16 kHz downsampling needed
+
+### 2. Commit
+
+- *(this session)* — Fix WAV sample rate + endMeeting race so meetings actually store transcripts
+
+
 
