@@ -173,8 +173,15 @@ actor CaptureEngine {
 
         guard let session = currentSession else { return }
 
-        // 1. Capture screenshot at native resolution
-        guard let image = await captureScreen() else { return }
+        // 1. Capture the image. Heartbeat keeps the full screen; event-driven
+        // triggers capture just the frontmost window (full-screen fallback).
+        let image: CGImage?
+        if trigger == "heartbeat" {
+            image = await captureScreen()
+        } else {
+            image = await captureFrontmostWindow()
+        }
+        guard let image else { return }
 
         // 2. Write to DB immediately (fast — don't block on extraction)
         let eventId = UUID().uuidString
@@ -313,6 +320,57 @@ actor CaptureEngine {
                 continuation.resume(returning: captured)
             }
         }
+    }
+
+    /// Capture just the frontmost app's topmost window, falling back to a
+    /// full-screen capture if no suitable window can be isolated.
+    private func captureFrontmostWindow() async -> CGImage? {
+        guard CGPreflightScreenCaptureAccess() else {
+            log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
+            return nil
+        }
+        if let windowID = frontmostWindowID() {
+            let image = await withCheckedContinuation { continuation in
+                let sem = DispatchSemaphore(value: 0)
+                var captured: CGImage? = nil
+                DispatchQueue.global(qos: .userInitiated).async {
+                    captured = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, .bestResolution)
+                    sem.signal()
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    if sem.wait(timeout: .now() + 5) == .timedOut {
+                        log("[CaptureEngine] ⚠️ captureFrontmostWindow: CGWindowListCreateImage timed out\n")
+                    } else if captured == nil {
+                        log("[CaptureEngine] ⚠️ captureFrontmostWindow: CGWindowListCreateImage returned nil\n")
+                    }
+                    continuation.resume(returning: captured)
+                }
+            }
+            if let image { return image }
+        }
+        // Fallback: full screen
+        return await captureScreen()
+    }
+
+    /// The CGWindowID of the frontmost app's topmost normal (layer 0) window,
+    /// if one is on screen and reasonably sized.
+    private func frontmostWindowID() -> CGWindowID? {
+        guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+            return nil
+        }
+        guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        for info in list {
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == frontPID else { continue }
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+            let bounds = info[kCGWindowBounds as String] as? [String: CGFloat] ?? [:]
+            let width = bounds["Width"] ?? 0
+            let height = bounds["Height"] ?? 0
+            guard width > 200, height > 100 else { continue }
+            return info[kCGWindowNumber as String] as? CGWindowID
+        }
+        return nil
     }
 
     // MARK: - Sessions
