@@ -1,8 +1,16 @@
 import Foundation
 import Cocoa
+import CoreAudio
+import CoreGraphics
 
-/// Detects active meetings by matching frontmost app bundle ID against
-/// the configured list, plus window-title patterns for Slack huddles (D15).
+/// Detects active meetings.
+///
+/// Primary signal: a configured meeting app (Teams/Zoom/Slack) is actively
+/// using the microphone — the same signal behind the macOS menu-bar orange
+/// dot. This is independent of which app is frontmost, so it survives
+/// clicking around during a call. Fallback: frontmost-app + window-title
+/// heuristics (covers muted stretches while a meeting app is focused, and
+/// Slack huddles).
 struct MeetingDetector {
     private let config: Config
 
@@ -10,14 +18,17 @@ struct MeetingDetector {
         self.config = config
     }
 
-    /// Returns true if the frontmost app appears to be in a meeting.
+    /// Returns true if a meeting appears to be active right now (start trigger).
     func isMeetingActive() -> Bool {
+        if isMeetingAppUsingMicrophone() {
+            return true
+        }
+
+        // Fallback: frontmost app is a meeting app (or has a huddle title).
         guard let app = NSWorkspace.shared.frontmostApplication,
               let bundleID = app.bundleIdentifier else {
             return false
         }
-
-        // Direct bundle ID match (Teams desktop, Zoom desktop)
         if config.meetingBundleIDs.contains(bundleID) {
             // For Slack specifically: also check window title for "huddle"
             if bundleID == "com.tinyspeck.slackmacgap" {
@@ -28,16 +39,32 @@ struct MeetingDetector {
         }
 
         // Window-title pattern match for browser-based or other edge cases
-        if hasMeetingWindowTitle() {
-            return true
-        }
-
-        return false
+        return hasMeetingWindowTitle()
     }
 
-    /// Returns the meeting app name for DB storage.
+    /// True if any configured meeting app is currently holding the microphone.
+    ///
+    /// Matches sub-bundles too (e.g. `com.microsoft.teams2.helper` counts as
+    /// Teams), because the process that actually opens the mic may be a helper.
+    func isMeetingAppUsingMicrophone() -> Bool {
+        let micUsers = Self.bundleIDsUsingMicrophone()
+        return micUsers.contains { bid in
+            config.meetingBundleIDs.contains { meeting in
+                bid == meeting || bid.hasPrefix(meeting + ".")
+            }
+        }
+    }
+
+    /// Returns the meeting app bundle ID for DB storage, preferring whichever
+    /// meeting app is actually using the mic over the frontmost app.
     func currentMeetingApp() -> String? {
-        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let micUsers = Self.bundleIDsUsingMicrophone()
+        for meeting in config.meetingBundleIDs {
+            if micUsers.contains(where: { $0 == meeting || $0.hasPrefix(meeting + ".") }) {
+                return meeting
+            }
+        }
+        return NSWorkspace.shared.frontmostApplication?.bundleIdentifier
     }
 
     private func hasMeetingWindowTitle() -> Bool {
@@ -60,5 +87,134 @@ struct MeetingDetector {
         return config.meetingWindowTitlePatterns.contains { pattern in
             lowercased.contains(pattern.lowercased())
         }
+    }
+
+    // MARK: - Meeting window tracking (CGWindowList)
+
+    /// Identity of the meeting window to track across polls.
+    struct MeetingWindowRef {
+        let title: String
+        let windowNumber: CGWindowID
+    }
+
+    /// The frontmost on-screen window owned by the meeting app — snapshotted at
+    /// meeting start so we can watch for it to disappear later.
+    func frontmostMeetingWindow(for bundleID: String) -> MeetingWindowRef? {
+        let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .map { $0.processIdentifier })
+        guard !pids.isEmpty else { return nil }
+
+        // On-screen list is ordered front-to-back; first match is the app's
+        // frontmost window (during a call, that's the call window).
+        for info in Self.windowList(onScreenOnly: true) {
+            guard let pid = Self.ownerPID(info), pids.contains(pid) else { continue }
+            return MeetingWindowRef(
+                title: Self.windowTitle(info),
+                windowNumber: Self.windowNumber(info)
+            )
+        }
+        return nil
+    }
+
+    /// True while a window matching the snapshot (same owner + title, or same
+    /// window number) is still present. Uses the full window list so minimized
+    /// windows still count as "the meeting is open".
+    func windowStillPresent(_ ref: MeetingWindowRef, for bundleID: String) -> Bool {
+        let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .map { $0.processIdentifier })
+        guard !pids.isEmpty else { return false }
+
+        for info in Self.windowList(onScreenOnly: false) {
+            guard let pid = Self.ownerPID(info), pids.contains(pid) else { continue }
+            if Self.windowNumber(info) == ref.windowNumber {
+                return true
+            }
+            if !ref.title.isEmpty && Self.windowTitle(info) == ref.title {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func windowList(onScreenOnly: Bool) -> [[String: Any]] {
+        var options: CGWindowListOption = [.excludeDesktopElements]
+        options.insert(onScreenOnly ? .optionOnScreenOnly : .optionAll)
+        return (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
+    }
+
+    private static func ownerPID(_ info: [String: Any]) -> pid_t? {
+        (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+    }
+
+    private static func windowTitle(_ info: [String: Any]) -> String {
+        info[kCGWindowName as String] as? String ?? ""
+    }
+
+    private static func windowNumber(_ info: [String: Any]) -> CGWindowID {
+        CGWindowID((info[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0)
+    }
+
+    // MARK: - CoreAudio mic-usage enumeration
+
+    /// Bundle IDs of processes with an active input (microphone) stream.
+    ///
+    /// Enumerates HAL client process objects (public CoreAudio API), filters to
+    /// those with an active input stream, and resolves each PID to a bundle ID
+    /// via NSRunningApplication. Observing usage requires no TCC mic permission
+    /// (only capturing does).
+    private static func bundleIDsUsingMicrophone() -> Set<String> {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size
+        ) == noErr, size > 0 else { return [] }
+
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var processes = [AudioObjectID](repeating: kAudioObjectUnknown, count: count)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &processes
+        ) == noErr else { return [] }
+
+        var result = Set<String>()
+        for process in processes {
+            guard isRunningInput(process),
+                  let bundleID = bundleIdentifier(for: process) else { continue }
+            result.insert(bundleID)
+        }
+        return result
+    }
+
+    /// True if the process currently has an active input (mic) stream.
+    private static func isRunningInput(_ process: AudioObjectID) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(process, &addr, 0, nil, &size, &value) == noErr else {
+            return false
+        }
+        return value != 0
+    }
+
+    /// Bundle ID for a process object, resolved via its PID.
+    private static func bundleIdentifier(for process: AudioObjectID) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var pid: pid_t = 0
+        var size = UInt32(MemoryLayout<pid_t>.size)
+        guard AudioObjectGetPropertyData(process, &addr, 0, nil, &size, &pid) == noErr else {
+            return nil
+        }
+        return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
     }
 }

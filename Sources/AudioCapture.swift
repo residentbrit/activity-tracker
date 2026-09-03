@@ -26,6 +26,15 @@ actor AudioCapture {
     private var peakRMS: Double = 0          // Diagnostic: loudest level seen this meeting
     private var audioSampleRate: Double = 16000  // Mic native sample rate, set at engine start
 
+    /// Window snapshot taken when the meeting started; we end the meeting only
+    /// once this window disappears (not when focus is lost).
+    private var meetingWindowRef: MeetingDetector.MeetingWindowRef?
+    private var meetingWindowMisses = 0
+
+    /// End the meeting only after its window has been absent this many
+    /// consecutive polls (12 × 5s = 60s grace).
+    private let meetingEndGracePolls = 12
+
     /// Poll meeting state every 5 seconds.
     private var pollTask: Task<Void, Never>?
 
@@ -73,18 +82,40 @@ actor AudioCapture {
     // MARK: - Meeting state machine
 
     private func checkMeetingState() async {
-        let meetingActive = meetingDetector.isMeetingActive()
-
-        if meetingActive && !isInMeeting {
-            await startMeeting()
-        } else if !meetingActive && isInMeeting {
-            await endMeeting()
+        if !isInMeeting {
+            // Start trigger: a meeting app is frontmost or using the mic.
+            if meetingDetector.isMeetingActive() {
+                await startMeeting()
+            }
+        } else if meetingStillActive() {
+            meetingWindowMisses = 0
+        } else {
+            // Stop trigger: the meeting window has been gone (and no meeting
+            // app is holding the mic) for a grace period. Focus is ignored.
+            meetingWindowMisses += 1
+            if meetingWindowMisses >= meetingEndGracePolls {
+                await endMeeting()
+            }
         }
+    }
+
+    /// True while the meeting is still going, regardless of which app is
+    /// frontmost: the tracked meeting window is still in the window list, or a
+    /// meeting app is still holding the microphone.
+    private func meetingStillActive() -> Bool {
+        if let ref = meetingWindowRef,
+           let app = currentMeetingApp,
+           meetingDetector.windowStillPresent(ref, for: app) {
+            return true
+        }
+        return meetingDetector.isMeetingAppUsingMicrophone()
     }
 
     private func startMeeting() async {
         isInMeeting = true
         currentMeetingApp = meetingDetector.currentMeetingApp()
+        meetingWindowRef = currentMeetingApp.flatMap { meetingDetector.frontmostMeetingWindow(for: $0) }
+        meetingWindowMisses = 0
         meetingStartTime = Date()
         speechSegments = []
         peakRMS = 0
@@ -131,6 +162,8 @@ actor AudioCapture {
         currentMeetingApp = nil
         meetingStartTime = nil
         currentMeetingSession = nil
+        meetingWindowRef = nil
+        meetingWindowMisses = 0
         speechSegments = []
         peakRMS = 0
 
