@@ -287,13 +287,17 @@ actor AudioCapture {
             return nil
         }
 
-        // Read output file: <wavFile>.txt
-        let outputPath = wavFile.deletingPathExtension().appendingPathExtension("txt")
+        // whisper-cli -otxt writes to <input>.txt — it appends ".txt" to the
+        // FULL input path (e.g. whisper-input-ABC.wav.txt), not replacing the
+        // .wav extension. Reading the wrong path here silently produced nil
+        // transcripts (whisper exited 0, but no .txt was found at <stem>.txt).
+        let outputPath = wavFile.appendingPathExtension("txt")
         defer { try? FileManager.default.removeItem(at: outputPath) }
 
         guard let transcript = (try? String(contentsOf: outputPath, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !transcript.isEmpty else {
+            log("[AudioCapture] no transcript output at \(outputPath.path)\n")
             return nil
         }
 
