@@ -44,6 +44,15 @@ struct ActivityTracker {
         let syncDB    = options.collectorOnly ? ((try? Database(config: config)) ?? db) : db
         let audioDB   = options.collectorOnly ? ((try? Database(config: config)) ?? db) : db
 
+        // Close sessions left dangling by a previous run (crashed/killed daemon).
+        if options.collectorOnly {
+            do {
+                try await EventStore(database: captureDB).closeDanglingSessions()
+            } catch {
+                log("closeDanglingSessions failed: \(error)")
+            }
+        }
+
         // 3-6: create subsystems (don't start them yet)
         log("initializing subsystems…")
         let captureEngine = CaptureEngine(config: config, database: captureDB)

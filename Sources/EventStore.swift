@@ -146,7 +146,20 @@ actor EventStore {
             """
         try execute(deleteSQL, params: [])
     }
-
+    /// Close any sessions left open by a previous run (crashed/killed daemon).
+    /// Sets ended_at to the last event captured in that session, falling back
+    /// to started_at for sessions that recorded no events.
+    func closeDanglingSessions() throws {
+        let sql = """
+            UPDATE sessions
+            SET ended_at = COALESCE(
+                (SELECT max(captured_at) FROM events e WHERE e.session_id = sessions.id),
+                started_at
+            )
+            WHERE ended_at IS NULL
+        """
+        try execute(sql, params: [])
+    }
     // MARK: - Audio segments
 
     func insertAudioSegment(
