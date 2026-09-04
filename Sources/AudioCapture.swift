@@ -103,6 +103,11 @@ actor AudioCapture {
     /// frontmost: the tracked meeting window is still in the window list, or a
     /// meeting app is still holding the microphone.
     private func meetingStillActive() -> Bool {
+        // (Re)snapshot the call window if we don't have one yet — it may appear
+        // a few seconds after the meeting starts, so retry each poll.
+        if meetingWindowRef == nil, let app = currentMeetingApp {
+            meetingWindowRef = meetingDetector.frontmostMeetingWindow(for: app)
+        }
         if let ref = meetingWindowRef,
            let app = currentMeetingApp,
            meetingDetector.windowStillPresent(ref, for: app) {

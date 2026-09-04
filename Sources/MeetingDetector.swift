@@ -97,19 +97,24 @@ struct MeetingDetector {
         let windowNumber: CGWindowID
     }
 
-    /// The frontmost on-screen window owned by the meeting app — snapshotted at
-    /// meeting start so we can watch for it to disappear later.
+    /// The frontmost on-screen **call** window owned by the meeting app, or nil
+    /// if none is identifiable yet. Snapshot at meeting start so we can watch
+    /// for it to disappear later. Main/app windows (e.g. "Calendar | Microsoft
+    /// Teams") are skipped — they persist after the call ends and would make
+    /// the meeting never end.
     func frontmostMeetingWindow(for bundleID: String) -> MeetingWindowRef? {
         let pids = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
             .map { $0.processIdentifier })
         guard !pids.isEmpty else { return nil }
 
-        // On-screen list is ordered front-to-back; first match is the app's
-        // frontmost window (during a call, that's the call window).
+        // On-screen list is ordered front-to-back; first non-base match is the
+        // app's frontmost call window.
         for info in Self.windowList(onScreenOnly: true) {
             guard let pid = Self.ownerPID(info), pids.contains(pid) else { continue }
+            let title = Self.windowTitle(info)
+            if isBaseWindowTitle(title, for: bundleID) { continue }
             return MeetingWindowRef(
-                title: Self.windowTitle(info),
+                title: title,
                 windowNumber: Self.windowNumber(info)
             )
         }
@@ -134,6 +139,24 @@ struct MeetingDetector {
             }
         }
         return false
+    }
+
+    /// True if the window title is the meeting app's base/main window (which
+    /// stays open after a call) rather than a call window (which closes).
+    private func isBaseWindowTitle(_ title: String, for bundleID: String) -> Bool {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return true }
+        let lower = t.lowercased()
+        switch bundleID {
+        case "com.microsoft.teams", "com.microsoft.teams2":
+            return t == "Microsoft Teams" || t.hasSuffix("| Microsoft Teams")
+        case "us.zoom.xos":
+            return t == "Zoom Workplace" || lower == "zoom.us" || t == "Zoom"
+        case "com.tinyspeck.slackmacgap":
+            return t == "Slack" || t.hasSuffix("| Slack")
+        default:
+            return t == (NSWorkspace.shared.frontmostApplication?.localizedName ?? "")
+        }
     }
 
     private static func windowList(onScreenOnly: Bool) -> [[String: Any]] {
