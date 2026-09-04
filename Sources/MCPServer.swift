@@ -186,6 +186,39 @@ actor MCPServer {
                     ],
                     "required": ["session_id"]
                 ]
+            ],
+            [
+                "name": "list_meetings",
+                "description": "List captured meeting transcripts with a preview. Newest first.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "limit": ["type": "integer", "description": "Max results (default 20, max 100)"]
+                    ]
+                ]
+            ],
+            [
+                "name": "get_meeting_transcript",
+                "description": "Get the full transcript for a meeting, by session_id or exact started_at (ISO 8601).",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "session_id": ["type": "string", "description": "Session UUID of the meeting"],
+                        "started_at": ["type": "string", "description": "Exact meeting start time, e.g. '2026-09-04T16:03:35Z'"]
+                    ]
+                ]
+            ],
+            [
+                "name": "search_transcripts",
+                "description": "Keyword search across meeting transcripts.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string", "description": "Search query text"],
+                        "limit": ["type": "integer", "description": "Max results (default 10)"]
+                    ],
+                    "required": ["query"]
+                ]
             ]
         ]
 
@@ -244,6 +277,20 @@ actor MCPServer {
                 throw ToolError.missingParam("session_id")
             }
             return try await getSession(sessionId)
+
+        case "list_meetings":
+            let limit = arguments["limit"] as? Int ?? 20
+            return try await listMeetings(limit: limit)
+
+        case "get_meeting_transcript":
+            let sessionId = arguments["session_id"] as? String
+            let startedAt = arguments["started_at"] as? String
+            return try await getMeetingTranscript(sessionId: sessionId, startedAt: startedAt)
+
+        case "search_transcripts":
+            let query = arguments["query"] as? String ?? ""
+            let limit = arguments["limit"] as? Int ?? 10
+            return try await searchTranscripts(query: query, limit: limit)
 
         default:
             throw ToolError.unknownTool(name)
@@ -515,6 +562,122 @@ actor MCPServer {
         ]
 
         return prettyJSON(result)
+    }
+
+    // MARK: - Meeting transcript tools
+
+    private func listMeetings(limit: Int) async throws -> String {
+        let clamped = min(max(limit, 1), 100)
+        let sql = """
+            SELECT id, session_id, started_at, ended_at, meeting_app, transcript
+            FROM audio_segments
+            ORDER BY started_at DESC
+            LIMIT \\(clamped)
+            """
+
+        var stmtPointer: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
+            throw ToolError.queryFailed
+        }
+        let stmt = stmtPointer!
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [[String: Any]] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let transcript = columnText(stmt, 5)
+            results.append([
+                "id": columnText(stmt, 0),
+                "session_id": columnText(stmt, 1),
+                "started_at": columnText(stmt, 2),
+                "ended_at": columnTextOrNull(stmt, 3) as Any,
+                "meeting_app": columnTextOrNull(stmt, 4) ?? "",
+                "transcript_length": transcript.count,
+                "preview": String(transcript.prefix(200))
+            ])
+        }
+
+        if results.isEmpty {
+            return "No meeting transcripts captured yet."
+        }
+
+        return prettyJSON(results)
+    }
+
+    private func getMeetingTranscript(sessionId: String?, startedAt: String?) async throws -> String {
+        var sql = "SELECT id, session_id, started_at, ended_at, meeting_app, transcript FROM audio_segments"
+        var param: String?
+        if let sessionId, !sessionId.isEmpty {
+            sql += " WHERE session_id = ?"
+            param = sessionId
+        } else if let startedAt, !startedAt.isEmpty {
+            sql += " WHERE started_at = ?"
+            param = startedAt
+        } else {
+            throw ToolError.missingParam("session_id or started_at")
+        }
+        sql += " ORDER BY started_at DESC LIMIT 1"
+
+        var stmtPointer: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
+            throw ToolError.queryFailed
+        }
+        let stmt = stmtPointer!
+        defer { sqlite3_finalize(stmt) }
+
+        if let param {
+            bindText(stmt, 1, param)
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return "No transcript found."
+        }
+
+        let result: [String: Any] = [
+            "session_id": columnText(stmt, 1),
+            "started_at": columnText(stmt, 2),
+            "ended_at": columnTextOrNull(stmt, 3) as Any,
+            "meeting_app": columnTextOrNull(stmt, 4) ?? "",
+            "transcript": columnText(stmt, 5)
+        ]
+        return prettyJSON(result)
+    }
+
+    private func searchTranscripts(query: String, limit: Int) async throws -> String {
+        let clamped = min(max(limit, 1), 100)
+        let sql = """
+            SELECT id, session_id, started_at, ended_at, meeting_app, transcript
+            FROM audio_segments
+            WHERE transcript LIKE ?
+            ORDER BY started_at DESC
+            LIMIT \\(clamped)
+            """
+        let pattern = "%\\(query)%"
+
+        var stmtPointer: OpaquePointer?
+        guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
+            throw ToolError.queryFailed
+        }
+        let stmt = stmtPointer!
+        defer { sqlite3_finalize(stmt) }
+
+        bindText(stmt, 1, pattern)
+
+        var results: [[String: Any]] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results.append([
+                "session_id": columnText(stmt, 1),
+                "started_at": columnText(stmt, 2),
+                "ended_at": columnTextOrNull(stmt, 3) as Any,
+                "meeting_app": columnTextOrNull(stmt, 4) ?? "",
+                "transcript": columnText(stmt, 5)
+            ])
+        }
+
+        if results.isEmpty {
+            return "No transcripts matched '\\(query)'."
+        }
+
+        return prettyJSON(results)
     }
 
     // MARK: - JSON-RPC response helpers
