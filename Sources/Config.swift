@@ -65,6 +65,13 @@ struct Config: Codable {
     /// Prune sync-outbox export files older than this many days.
     /// 0 (the default) keeps everything — see `SyncEngine.pruneOutbox`.
     var syncOutboxRetentionDays: Int = 0
+    /// Write JSON export files to `sync-outbox/` for a homellm-side collector.
+    ///
+    /// Off by default: that collector was never built, so the files accumulated
+    /// with nothing reading them (~1GB). The direct SQLite→pgvector sync
+    /// (`scripts/sync_to_pgvector.py`) replaces this path. Kept as a switch
+    /// rather than deleted so the old mechanism remains available if needed.
+    var syncOutboxEnabled: Bool = false
     var syncTarget: SyncTarget = SyncTarget()
 
     struct SyncTarget: Codable {

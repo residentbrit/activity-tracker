@@ -203,7 +203,7 @@ anyway (~4KB per row).
 1. TODO: add a per-app exclusion list before unattended always-on use, so sensitive apps and windows can be skipped.
 2. Slack answers are currently limited to what was actually visible on screen; channel-aware history would require a separate Slack API integration.
 3. Capture-time embedding is fire-and-forget: if an embed fails, the row stays unembedded. A 30-minute launchd sweep (`make embedbackfill-install`) drains them within half an hour, but the daemon itself still has no retry.
-4. The sync outbox grows unbounded unless `syncOutboxRetentionDays` is set — check `du -sh ~/.local/share/activity-tracker/sync-outbox/` if disk use matters.
+4. The legacy outbox's ~990MB of already-written export files are still on disk. The exporter is off, so they no longer grow; delete the directory when convenient.
 
 ## Configuration
 
@@ -231,6 +231,7 @@ home directory):
   ],
   "screenshotRetentionHours" : 24,
   "syncIntervalMin" : 30,
+  "syncOutboxEnabled" : false,
   "syncOutboxRetentionDays" : 0,
   "syncTarget" : {
     "database" : "phillip_ai",
@@ -331,22 +332,28 @@ How it works:
 A full first run pushes ~82k rows (the accumulated history) and takes a few
 minutes; subsequent runs only send new events.
 
-### Retiring the legacy outbox
+### Legacy outbox (now disabled)
 
 The older design wrote a JSON file every 30 minutes to
-`~/.local/share/activity-tracker/sync-outbox/` for a companion script on homellm
-to collect. That script was never built, so the files accumulated (~980MB) with
-nothing reading them. It is now redundant:
+`~/.local/share/activity-tracker/sync-outbox/` for a companion script on homellm to
+collect. That script was never built, so nothing ever read the files — they just
+accumulated. The exporter is now **off** by default (`syncOutboxEnabled: false`); turn
+it back on only if you resurrect that approach.
 
-1. The direct sync above covers the same ground.
-2. To stop the daemon writing files, remove the `SyncEngine.performSync()` export
-   path (and repoint `get_sync_status` at the `pg_synced` queue, since `synced`
-   loses its meaning once nothing consumes it).
-3. Then delete `~/.local/share/activity-tracker/sync-outbox/`. The rows are still
-   in the local DB, so nothing is lost — but note the daemon marks them `synced`,
-   not `pg_synced`, so the direct sync will still pick them all up.
+While it is off, `syncIntervalMin` and `syncOutboxRetentionDays` do nothing.
 
-Duplicate rows are not exported, so the outbox carries one copy of any given screen.
+The ~990MB of files already written are still on disk and are safe to delete — the rows
+behind them all remain in the local DB, and the direct sync pushes from the DB rather
+than from these files:
+
+```bash
+rm -rf ~/.local/share/activity-tracker/sync-outbox/
+```
+
+One wrinkle if you do: those rows are marked `synced` (by the old exporter), not
+`pg_synced`, so the direct sync will still pick every one of them up.
+
+Duplicate rows were never exported, so the outbox held only one copy of any given screen.
 
 ## Tech stack
 

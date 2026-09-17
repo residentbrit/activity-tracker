@@ -691,14 +691,17 @@ actor MCPServer {
 
     /// Report the pipeline's real queues.
     ///
-    /// There are three stages, each marked by its own column, and reporting only
-    /// the legacy file export (as this used to) says nothing about whether
-    /// recently captured activity is actually searchable yet.
+    /// Two stages, each marked by its own column. Reporting only the legacy file
+    /// export (as this used to) said nothing about whether recently captured
+    /// activity is searchable yet.
     ///   * `embedding IS NULL` — captured but not yet embedded (live embedder +
-    ///     30-minute sweep). While this is non-zero, semantic search cannot see
-    ///     those rows even though they exist.
+    ///     30-minute sweep). While non-zero, semantic search cannot see those rows
+    ///     even though they exist.
     ///   * `pg_synced = 0`     — embedded but not yet pushed to homellm pgvector.
-    ///   * `synced = 0`        — legacy: not yet written to the file outbox.
+    ///
+    /// The old third queue (`synced`, for the file outbox) is no longer reported:
+    /// that exporter is off by default (`Config.syncOutboxEnabled`), so its count
+    /// would only grow and mean nothing.
     private func getSyncStatus() async -> String {
         let status: [String: Any] = [
             "embed_queue": countRows(
@@ -708,20 +711,10 @@ actor MCPServer {
             "ship_queue": countRows(
                 "SELECT COUNT(*) FROM events WHERE pg_synced = 0 AND is_duplicate = 0"
             ),
-            "legacy_outbox_queue": countRows(
-                "SELECT COUNT(*) FROM events WHERE synced = 0 AND is_duplicate = 0"
-            ),
             "queue_meaning": [
                 "embed_queue": "awaiting embedding — invisible to semantic search",
                 "ship_queue": "awaiting push to homellm pgvector (`make sync-pgvector`)",
-                "legacy_outbox_queue": "awaiting the retired file export; safe to ignore",
             ],
-            "last_file_export_at": db.queryOne(
-                "SELECT started_at FROM sync_log ORDER BY id DESC LIMIT 1"
-            )?.first ?? NSNull(),
-            "last_file_export_status": db.queryOne(
-                "SELECT status FROM sync_log ORDER BY id DESC LIMIT 1"
-            )?.first ?? "never",
         ]
 
         if let data = try? JSONSerialization.data(withJSONObject: status, options: .prettyPrinted),

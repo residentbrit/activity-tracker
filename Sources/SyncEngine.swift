@@ -93,6 +93,12 @@ actor SyncEngine {
     }
 
     private func performSync() async throws {
+        // The file export is off by default — see `Config.syncOutboxEnabled`.
+        // This path wrote JSON files for a homellm-side collector that was never
+        // built, so nothing read them. `scripts/sync_to_pgvector.py` now pushes to
+        // pgvector directly. Set syncOutboxEnabled to re-enable.
+        guard config.syncOutboxEnabled else { return }
+
         let startedAt = nowISO()
         let logId = try await eventStore.insertSyncLog(startedAt: startedAt)
 

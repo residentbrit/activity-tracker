@@ -1052,6 +1052,44 @@ not just the new one), and easy to miss. Anyone adding a config setting to this 
 should add it to `Config` and rely on the defaulting decode — and check the startup log
 line, which now shows what actually loaded.
 
+---
+
+## 2026-09-17 (night) — Outbox exporter switched off
+
+Confirmed the outbox has exactly one purpose, by enumerating every use of the flag
+rather than assuming:
+
+| Consumer of `synced` / the outbox | Role |
+|---|---|
+| `SyncEngine.swift` | writes the files, sets `synced` — the whole mechanism |
+| `EventStore.swift` | `unsyncedEvents` / `markSynced` / `unsyncedCount` — its own helpers |
+| `MCPServer.swift` | only *reported* the count, no behaviour |
+| `CaptureEngine.swift` | **no use at all** |
+
+That last row was the one that mattered: screenshot purging does *not* depend on
+`synced` (that coupling was removed in the 8/12 purge fix), so nothing functional hangs
+off it. Nothing reads the files either — verified by grepping the whole repo for
+`sync-outbox` outside `SyncEngine` and the README.
+
+So the exporter is now off by default via `syncOutboxEnabled: false`, with `performSync`
+returning early and a comment pointing at the replacement. It's a switch rather than a
+deletion, so the mechanism stays available if the file-drop approach is ever wanted.
+
+Also dropped `legacy_outbox_queue` from `get_sync_status`: with the exporter off, that
+count could only grow (nothing sets `synced` any more) and describe nothing. `MCPServer`
+doesn't receive the config, so it can't conditionally report it — the honest fix was to
+stop reporting it. Status now covers the two queues that have real consumers.
+
+Verified after deploy: outbox file count unchanged (834 before and after a restart), no
+new rows in `sync_log`, daemon still capturing. The config came up with
+`absent keys keep their defaults: syncOutboxEnabled, syncOutboxRetentionDays` — the
+defaulting decoder added earlier tonight handled a brand-new key cleanly, which is
+exactly the case that broke everything this afternoon.
+
+The 990MB of existing files were deliberately **not** deleted; the README says how, and
+the rows behind them are all in the local DB. Those rows carry `synced = 1`, not
+`pg_synced`, so the direct sync still queues every one of them.
+
 ### 7. Key Lessons
 
 - **A missing row and a missing embedding look identical to a query.** Both produce
