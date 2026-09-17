@@ -1011,9 +1011,19 @@ config load failed, using defaults: keyNotFound(... "syncOutboxRetentionDays" ..
 
 Swift's synthesised `Codable` throws on a missing key rather than falling back to the
 property's default value — property defaults only apply to the memberwise initialiser.
-The daemon logged one line and carried on with *all-default settings*, which meant the
-corrected `teams2` meeting bundle id and the 15s heartbeat were silently ignored for
-about five minutes until I noticed the log line by accident.
+Because decoding is all-or-nothing, that one absent key failed the *whole* decode and
+`main.swift` substituted a fresh `Config()` — so **every** setting reverted to its
+default, not just the new one.
+
+**Measured impact** (correcting an earlier guess of "about five minutes"): the first
+build carrying the field was installed at 18:43:32 and the fix at 21:23:10, so the
+daemon ran on default settings for **2h39m across four restarts**. During that window:
+
+- 1,093 events captured normally — no data loss, nothing written elsewhere
+- heartbeats ran at 30s instead of the configured 15s (fewer full-screen captures)
+- `teams2` was absent from the effective meeting bundle ids, so a Teams call would not
+  have been detected. Teams happened not to be used in that window (0 teams2 events,
+  0 audio segments), so it cost nothing in practice — luck, not design.
 
 Fixed by overlaying the file's JSON onto the encoded defaults (recursively, so a
 partially-specified `syncTarget` can't lose its defaults either) and logging which keys
