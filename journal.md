@@ -730,5 +730,172 @@ Meetings are now detected and audio flows (peak RMS up to 13k), but nothing was 
 
 - *(this session)* — Fix WAV sample rate + endMeeting race so meetings actually store transcripts
 
+---
+
+## 2026-09-03 – 2026-09-04 (recorded retroactively)
+
+Not journaled at the time; reconstructed from commits.
+
+- `4d4f8c5` — Fix whisper transcript output path (`.wav.txt`, not `.txt`)
+- `69dd0f9` — Detect meetings via window presence + mic usage, not focus
+- `33f386d` — Capture frontmost window for event triggers, keep full-screen heartbeat
+- `1aeab3a` — Snapshot the call window, not the main app window, for meeting end detection
+- `99d5533` — Close dangling sessions on startup
+- `be5ef0e` — Add meeting transcript tools to MCP server
+
+This supersedes the 8/12 note that full-screen capture was still broken: event-driven
+captures now use the frontmost window, with the full-screen composite reserved for
+heartbeat only.
+
+---
+
+## 2026-09-17
+
+### Session Summary
+Cleared the embedding backlog, made the backfill fast and self-healing, and finally
+built the semantic search the embeddings were always meant to feed. Also settled the
+"should duplicates be embedded" question with measurements rather than opinion.
+
+---
+
+### 1. The Backlog Was Not 56,000 Rows
+
+The headline "56,293 unembedded events" decomposed into mostly non-problems:
+
+| Bucket | Rows | Verdict |
+|---|---|---|
+| Duplicates (`is_duplicate = 1`) | 47,252 | By design — deliberately inserted with `embedding: nil` |
+| No text content | ~5,800 | Not embeddable |
+| Non-duplicate rows with text | **3,362** | The real backlog |
+
+**Why it kept growing:** `processEvent` embeds fire-and-forget —
+`extractionQueue.async { Task { ... } }` with no retry. If the embed returns nil
+(server busy, oversized input, daemon restart mid-flight) the row stays `NULL`
+forever, invisible to semantic search. That leak was running at ~300-500 rows/day.
+
+### 2. Backfill Now Goes Through the Embed Server
+
+`scripts/backfill_embeddings.py` spawned `llama-embedding` per row, reloading the
+model each time. It now POSTs batches of 32 to the resident `llama-server` — the
+same endpoint the daemon embeds through, so vectors are identical to live captures.
+
+**Result: 3,362 rows in 3 minutes, 0 failures** (previously hours).
+
+Two distinct token-limit failures were being conflated:
+- Prose that is token-dense (SID/hostname lists) → word caps work
+- An 829-char SAML URL — a *single* whitespace word, hundreds of tokens → word caps
+  can never shrink it; character caps (600/300/150/75) are required
+
+The server reports this as `HTTP 500 — input (524 tokens) is too large to process`,
+which is the same condition as `llama-embedding`'s historical `rc:-6` SIGABRT.
+
+### 3. Self-Healing Sweep
+
+Added `com.activitytracker.embedbackfill` (`make embedbackfill-install`) — every 30
+minutes, capped at 2,000 rows. Deliberately a launchd job rather than re-enabling the
+in-daemon `startEmbeddingBackfill()`: no Swift rebuild, no binary re-sign, no TCC
+re-grant. It found and embedded 2 leaked rows within 20 minutes of being installed.
+
+### 4. Duplicates: Measured, Not Guessed
+
+- All four query sites filter `is_duplicate = 0`, so a duplicate's vector would be
+  unreachable by any tool that exists.
+- 27,541 of 47,282 duplicates (58%) share a `dedup_key` with an already-embedded row.
+- **The "embed and compare" test:** cosine similarity between consecutive same-app
+  captures — only **0.3%** exceed 0.98, and 90.7% fall in 0.50-0.90. Exact-hash
+  dedup is not letting meaningful near-duplicates through, so a similarity-based
+  collapse would add real complexity to catch ~7 rows/day. Mean of 0.70 is explained
+  by D18: each row's vector represents the *diff*, not the full text.
+
+**Decision: leave duplicates unembedded.** If temporal completeness ("was this on
+screen at 3pm?") ever matters, the cheap route is resolving a duplicate through its
+`dedup_key` twin at query time — 8 bytes of index, no 4KB vector per row.
+
+### 5. Semantic Search
+
+`search_activities` is now hybrid. The TODO at `MCPServer.swift` ("when llama.cpp is
+integrated, this becomes semantic search") is closed.
+
+**Threshold calibrated against real data:** genuine matches score 0.72-0.78,
+unrelated content tops out near 0.60, and a query with no real answer peaked at
+0.597. A 0.62 floor therefore returns *nothing* rather than least-unrelated noise.
+
+**Fusion is additive, not reciprocal-rank.** This came out of measurement, not
+theory. RRF initially looked correct — then a query for a ticket id that exists
+verbatim in 1,455 rows returned five semantic near-misses and zero of the real
+matches. The reason: the semantic list is ordered by relevance, but a `LIKE` result
+set is ordered by *recency*, so its rank position carries no information. Weighting
+it cannot fix that; only a boost can.
+
+**And a boost alone wasn't enough either.** Keyword candidates that don't reach the
+semantic top-k have no similarity score, so they could only ever contribute their
+small boost and lost to every semantic hit — the same query still returned none of
+its 1,455 matches. Fixed by scoring those candidates directly
+(`SemanticSearch.similarities`: one dot product per id, ~15 of them) so
+`score = similarity + boost` holds for every candidate.
+
+Final weights: **+0.10** for a literal hit on a distinctive identifier, **+0.08**
+for a window-title/app-name match, **+0.02** for a common word in a large OCR blob.
+Measured justification for the 0.10: the ticket id scored 0.68 against a screen that
+was merely *similar* at 0.75, so the boost has to exceed that gap for literal
+presence to win — which it now does (all five top hits for `DBAAAS-1361` contain it).
+
+Other details:
+- De-duplication on `app + first 200 chars`, because one screen can produce hundreds
+  of near-identical rows (the same Slack window captured 5s apart filled the top 5).
+- Brute-force scan, no vector index: streams `(id, embedding)` and keeps a bounded
+  top-k, so text is never copied for a row that won't be returned. vDSP dot product
+  on a reused scratch buffer. Stored vectors verified unit-length (norms 1.0000
+  across 40k rows) so cosine reduces to a dot product. ~500ms over ~75k rows,
+  ~130ms when a time range narrows the set.
+- New optional `start`/`end` parameters on the tool.
+- If the embed server is down, it degrades to keyword-only *and says so*, rather
+  than reporting a false "no activity found" — the failure mode that caused the
+  original Claude Desktop confusion.
+
+### 6. Findings Left Open
+
+1. **Sync outbox: 975MB across 820 files, growing ~100MB/day since 2026-08-03.**
+   `SyncEngine` writes a ~2MB file every 30 min and marks rows `synced=1`, but
+   nothing deletes or acknowledges them — `synced` means "written to outbox", not
+   "delivered". No consumer found: no local homellm repo, nothing outside this repo
+   references `sync-outbox`, and `syncTarget.password` is empty (though
+   `192.168.1.33:5433` is reachable). Opt-in retention was added
+   (`syncOutboxRetentionDays`, default 0 = keep everything) rather than deleting
+   data whose consumer couldn't be verified.
+2. **Repo defaults still ship the wrong LibreWolf bundle id.** The 8/12 fix went
+   only into `~/.config/activity-tracker/config.json`, which lives outside the repo,
+   so `Sources/Config.swift` and `Sources/CaptureEngine.swift` would reintroduce the
+   bug on a fresh clone. Corrected.
+3. **The daemon's embed retry gap still exists.** The 30-minute sweep papers over it;
+   a proper fix is retry/backoff in the capture path.
+- **A boost only works if the boosted candidate also has the base score.** Keyword
+  rows outside the semantic top-k had no similarity, so the boost couldn't lift them
+  above anything — a subtle ordering bug that only a real query exposed.
+- **The Swift compiler can hang instead of erroring.** Two expressions — a
+  `guard let x = try? a.b().c, x < y` chain, and `.map{}.filter{}.sorted{ternary}`
+  chained over `Dictionary.Values` with `[String: Any]` payloads — pinned one
+  frontend at 100% CPU for 10+ minutes with no output, in both debug and release.
+  Rewriting them with explicit types and plain loops took the build from hung to
+  **4-6 seconds**. Worth knowing: a stalled build is not always a slow machine.
+  (That said, Microsoft Defender pegging ~300% CPU also made builds crawl, so check
+  `ps -Ao %cpu,comm | sort -rn` before blaming the compiler.)
+- **Timestamp comparison got me again.** `captured_at` is `YYYY-MM-DDTHH:MM:SSZ`, so
+  comparing it against `datetime('now','-5 minutes')` (space separator) matched the
+  entire day, because `T` > ` ` lexicographically. I briefly misread a 5-minute
+  window as 1,872 heartbeats before spotting it. This is the *same* mistake recorded
+  on 2026-08-12 — wrap the column: `datetime(captured_at) > ...`.
+
+### 7. Key Lessons
+
+- **A missing row and a missing embedding look identical to a query.** Both produce
+  silence, so the failure is invisible until you measure the table directly.
+- **Exact-hash dedup is not the same as semantic redundancy** — measured 0.3%, so
+  this was worth testing rather than assuming.
+- **Rank fusion assumes both lists rank by relevance.** A recency-ordered `LIKE`
+  result set is not a ranking, and fusing it by rank silently buries exact matches.
+- **Word count is a poor proxy for token count** (an 829-char URL is one word), and
+  character caps are the only reliable way to shrink pathological input.
+
 
 

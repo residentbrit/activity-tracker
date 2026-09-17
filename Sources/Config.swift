@@ -17,7 +17,7 @@ struct Config: Codable {
         "com.microsoft.VSCode",             // VS Code
         "com.apple.Terminal",               // Terminal
         "com.google.Chrome",                // Chrome
-        "io.gitlab.librewolf-community",    // LibreWolf
+        "net.librewolf.librewolf",          // LibreWolf (NOT io.gitlab.librewolf-community)
         "com.microsoft.Outlook",            // Outlook
     ]
     var tier1PollIntervalSec: Int = 5
@@ -46,6 +46,9 @@ struct Config: Codable {
 
     // MARK: Sync (D13)
     var syncIntervalMin: Int = 30
+    /// Prune sync-outbox export files older than this many days.
+    /// 0 (the default) keeps everything — see `SyncEngine.pruneOutbox`.
+    var syncOutboxRetentionDays: Int = 0
     var syncTarget: SyncTarget = SyncTarget()
 
     struct SyncTarget: Codable {

@@ -40,6 +40,58 @@ actor SyncEngine {
         }
     }
 
+    /// Delete outbox exports older than `syncOutboxRetentionDays`.
+    ///
+    /// Nothing consumes these files automatically and `markSynced` records that a
+    /// row was *written* to the outbox, not that it was delivered — so without a
+    /// retention window the directory grows forever (~100MB/day at current rates).
+    /// Retention is opt-in: the default of 0 keeps every file, so this can't
+    /// delete data for a consumer that might still be pulling it.
+    private func pruneOutbox() {
+        let retentionDays = config.syncOutboxRetentionDays
+        guard retentionDays > 0 else { return }
+
+        let cutoff: Date = Date().addingTimeInterval(-Double(retentionDays) * 86_400)
+        let directory = URL(fileURLWithPath: exportDir)
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey]
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: Array(keys),
+                options: []
+            )
+        } catch {
+            return
+        }
+
+        var removed = 0
+        var bytes = 0
+        for file in files {
+            if file.pathExtension != "json" { continue }
+
+            let values = try? file.resourceValues(forKeys: keys)
+            guard let modified: Date = values?.contentModificationDate else { continue }
+            if modified >= cutoff { continue }
+
+            let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
+            let size: Int = (attributes?[FileAttributeKey.size] as? Int) ?? 0
+
+            do {
+                try FileManager.default.removeItem(at: file)
+                removed += 1
+                bytes += size
+            } catch {
+                continue
+            }
+        }
+
+        if removed > 0 {
+            log("[SyncEngine] pruned \(removed) outbox file(s), \(bytes / 1_048_576)MB, "
+                + "older than \(retentionDays)d\n")
+        }
+    }
+
     private func performSync() async throws {
         let startedAt = nowISO()
         let logId = try await eventStore.insertSyncLog(startedAt: startedAt)
@@ -47,6 +99,7 @@ actor SyncEngine {
         let events = try await eventStore.unsyncedEvents(limit: 500)
         guard !events.isEmpty else {
             try await eventStore.updateSyncLog(id: logId, endedAt: nowISO(), eventsSynced: 0, status: "nothing_to_sync")
+            pruneOutbox()
             return
         }
 
@@ -85,6 +138,7 @@ actor SyncEngine {
 
         try await eventStore.updateSyncLog(id: logId, endedAt: nowISO(), eventsSynced: syncedIDs.count, status: "exported")
         log("[SyncEngine] exported \(syncedIDs.count) events → \(filename)\n")
+        pruneOutbox()
     }
 
     func status() async -> SyncStatus {

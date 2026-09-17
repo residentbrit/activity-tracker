@@ -125,12 +125,14 @@ actor MCPServer {
         let tools: [[String: Any]] = [
             [
                 "name": "search_activities",
-                "description": "Search captured activity by keyword. Returns matching events with timestamps, app context, and extracted text.",
+                "description": "Search captured activity by keyword or concept. Hybrid: exact keyword matching plus semantic similarity over on-device embeddings, so paraphrases and concepts match even when the exact words were never on screen. Returns events with timestamps, app context, and extracted text.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
-                        "query": ["type": "string", "description": "Search query text"],
-                        "limit": ["type": "integer", "description": "Max results (default 20)"]
+                        "query": ["type": "string", "description": "Search query — keywords or a description of what you're looking for"],
+                        "limit": ["type": "integer", "description": "Max results (default 20, max 100)"],
+                        "start": ["type": "string", "description": "Optional start time (ISO 8601, inclusive). e.g. '2026-09-14T08:00:00'"],
+                        "end": ["type": "string", "description": "Optional end time (ISO 8601, exclusive). e.g. '2026-09-15T08:00:00'"]
                     ],
                     "required": ["query"]
                 ]
@@ -252,7 +254,9 @@ actor MCPServer {
         case "search_activities":
             let query = arguments["query"] as? String ?? ""
             let limit = arguments["limit"] as? Int ?? 20
-            return try await searchActivities(query: query, limit: limit)
+            let start = arguments["start"] as? String
+            let end = arguments["end"] as? String
+            return try await searchActivities(query: query, limit: limit, start: start, end: end)
 
         case "get_recent_activity":
             let minutes = arguments["minutes"] as? Int ?? 60
@@ -299,33 +303,194 @@ actor MCPServer {
 
     // MARK: - Tool implementations
 
-    private func searchActivities(query: String, limit: Int) async throws -> String {
-        // Full-text search over text_content + structured fields.
-        // When llama.cpp is integrated, this becomes semantic search via embeddings.
+    /// Hybrid search: embedding similarity, with literal matches as a boost.
+    ///
+    /// Keyword alone misses paraphrase — "change ticket for production
+    /// deployment" returns nothing by LIKE even though those conversations are on
+    /// record, because those words never appear in that order. Semantic alone is
+    /// weak on exact tokens: a ticket id should rank by literal presence, not by
+    /// proximity in embedding space (a query for one scored 0.73 against screens
+    /// that merely looked similar, while 1,455 rows contained it verbatim).
+    ///
+    /// Fusion is additive rather than rank-based, because the two lists aren't
+    /// comparable: the semantic list is ordered by relevance, while a LIKE result
+    /// set is ordered by recency, so its rank position carries no information. A
+    /// literal match adds a bounded boost on top of the semantic score instead —
+    /// larger for distinctive single-token queries and short curated fields,
+    /// smaller for a common word inside a large OCR blob.
+    private func searchActivities(
+        query: String, limit: Int, start: String? = nil, end: String? = nil
+    ) async throws -> String {
+        let clampedLimit = min(max(limit, 1), 100)
+        let candidates = clampedLimit * 3
+        let startUTC = start.flatMap(normalizeToUTC)
+        let endUTC = end.flatMap(normalizeToUTC)
+
+        let keyword = try keywordMatches(
+            query: query, limit: candidates, start: startUTC, end: endUTC
+        )
+
+        // Empty query means "no keyword filter" — skip semantics, keep the
+        // recent-capture behaviour the tool has always had.
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var semanticAvailable = true
+        var vector: [Float]?
+        if !trimmedQuery.isEmpty {
+            vector = await queryVector(trimmedQuery)
+            semanticAvailable = vector != nil
+        }
+        let semanticHits = await semanticMatches(
+            vector: vector, limit: candidates, start: startUTC, end: endUTC
+        )
+
+        let distinctive = isDistinctiveToken(query)
+
+        // Keyword matches outside the semantic top-k still need a real score, or
+        // they can only ever contribute their small boost and lose to every
+        // semantic hit. Score them directly instead.
+        let semanticIDs = Set(semanticHits.compactMap { $0["id"] as? String })
+        let unscored = keyword.compactMap { $0["id"] as? String }.filter { !semanticIDs.contains($0) }
+        var fillIn: [String: Float] = [:]
+        if let vector, !unscored.isEmpty {
+            let handle = db.handle
+            fillIn = await Task.detached(priority: .userInitiated) {
+                SemanticSearch.similarities(handle: handle, query: vector, eventIDs: unscored)
+            }.value
+        }
+
+        var fused: [String: FusedHit] = [:]
+
+        for hit in keyword {
+            guard let id = hit["id"] as? String else { continue }
+            var entry = fused[id] ?? FusedHit(payload: hit)
+            entry.viaKeyword = true
+            entry.keywordBoost = keywordBoost(for: hit, distinctive: distinctive)
+            entry.capturedAt = hit["captured_at"] as? String ?? ""
+            if entry.similarity == nil, let similarity = fillIn[id] {
+                entry.similarity = Double((similarity * 100).rounded()) / 100
+            }
+            fused[id] = entry
+        }
+
+        for hit in semanticHits {
+            guard let id = hit["id"] as? String else { continue }
+            var entry = fused[id] ?? FusedHit(payload: hit)
+            entry.viaSemantic = true
+            entry.similarity = hit["similarity"] as? Double
+            entry.capturedAt = hit["captured_at"] as? String ?? ""
+            fused[id] = entry
+        }
+
+        var scored: [FusedHit] = []
+        scored.reserveCapacity(fused.count)
+        for entry in fused.values {
+            var copy: FusedHit = entry
+            copy.score = (copy.similarity ?? 0) + copy.keywordBoost
+            if copy.score > 0 {
+                scored.append(copy)
+            }
+        }
+        // Relevance first, then recency. The tie-break matters: a keyword-only
+        // result set shares one boost value, so without it those rows would come
+        // back in arbitrary order.
+        scored.sort { (first: FusedHit, second: FusedHit) -> Bool in
+            if first.score == second.score {
+                return first.capturedAt > second.capturedAt
+            }
+            return first.score > second.score
+        }
+
+        var results: [[String: Any]] = []
+        var seenIdentities = Set<String>()
+        for entry in scored {
+            var payload = entry.payload
+            // One screen can produce hundreds of matching rows; keep the best and
+            // skip the rest so they don't consume the whole result list.
+            let identity = resultIdentity(payload)
+            guard seenIdentities.insert(identity).inserted else { continue }
+
+            switch (entry.viaKeyword, entry.viaSemantic) {
+            case (true, true): payload["match_source"] = "keyword+semantic"
+            case (true, false): payload["match_source"] = "keyword"
+            default: payload["match_source"] = "semantic"
+            }
+            if let similarity = entry.similarity {
+                payload["similarity"] = similarity
+            }
+
+            results.append(payload)
+            if results.count == clampedLimit { break }
+        }
+
+        guard !results.isEmpty else {
+            if semanticAvailable {
+                return "No matching activity found for '\(query)'."
+            }
+            return "No matching activity found for '\(query)' (semantic search "
+                + "unavailable — embed server not responding, keyword search only)."
+        }
+
+        return prettyJSON(results)
+    }
+
+    /// A single distinctive token — a ticket id, hostname or error code. Literal
+    /// matches on these are high precision, unlike a common word buried in a large
+    /// OCR blob, so they earn the larger boost.
+    private func isDistinctiveToken(_ query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace) else { return false }
+        guard trimmed.count >= 4 else { return false }
+        return trimmed.contains(where: \.isNumber)
+            || trimmed.contains("-")
+            || trimmed.contains("_")
+    }
+
+    private func keywordBoost(for hit: [String: Any], distinctive: Bool) -> Double {
+        switch hit["match_source"] as? String {
+        case "window_title", "app_name":
+            // Short curated fields — a match here is meaningful on its own.
+            return 0.08
+        case "text_content":
+            // Large enough that a literal hit on an identifier outranks a screen
+            // that is merely similar (measured: a ticket id present in 1,455 rows
+            // scored 0.68 against a similar-looking screen's 0.75).
+            return distinctive ? 0.10 : 0.02
+        default:
+            return 0.02
+        }
+    }
+
+    /// Identity of a result for de-duplication: same app, same opening content.
+    private func resultIdentity(_ payload: [String: Any]) -> String {
+        let app = payload["app_name"] as? String ?? ""
+        let text = payload["text"] as? String ?? ""
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return "\(app)|\(collapsed.prefix(200))"
+    }
+
+    private func keywordMatches(
+        query: String, limit: Int, start: String?, end: String?
+    ) throws -> [[String: Any]] {
+        var conditions = [
+            "is_duplicate = 0",
+            "(text_content LIKE ? OR window_title LIKE ? OR app_name LIKE ?)",
+        ]
+        if start != nil { conditions.append("captured_at >= ?") }
+        if end != nil { conditions.append("captured_at < ?") }
+
         let sql = """
-                        SELECT captured_at,
-                                     app_name,
-                                     window_title,
-                                     source_type,
-                                     text_content,
-                                     CASE
-                                         WHEN text_content LIKE ? THEN 'text_content'
-                                         WHEN window_title LIKE ? THEN 'window_title'
-                                         WHEN app_name LIKE ? THEN 'app_name'
-                                         ELSE 'unknown'
-                                     END AS match_source,
-                                     CASE
-                                         WHEN COALESCE(text_content, '') != '' THEN text_content
-                                         WHEN COALESCE(window_title, '') != '' THEN window_title
-                                         ELSE COALESCE(app_name, '')
-                                     END AS display_text
+            SELECT id, captured_at, app_name, window_title, source_type, text_content,
+                   CASE
+                       WHEN text_content LIKE ? THEN 'text_content'
+                       WHEN window_title LIKE ? THEN 'window_title'
+                       WHEN app_name LIKE ? THEN 'app_name'
+                       ELSE 'unknown'
+                   END AS match_source
             FROM events
-            WHERE is_duplicate = 0
-              AND (text_content LIKE ? OR window_title LIKE ? OR app_name LIKE ?)
+            WHERE \(conditions.joined(separator: " AND "))
             ORDER BY captured_at DESC
             LIMIT ?
             """
-        let pattern = "%\(query)%"
 
         var stmtPointer: OpaquePointer?
         guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
@@ -334,32 +499,102 @@ actor MCPServer {
         let stmt = stmtPointer!
         defer { sqlite3_finalize(stmt) }
 
-        bindText(stmt, 1, pattern)
-        bindText(stmt, 2, pattern)
-        bindText(stmt, 3, pattern)
-        bindText(stmt, 4, pattern)
-        bindText(stmt, 5, pattern)
-        bindText(stmt, 6, pattern)
-        sqlite3_bind_int(stmt, 7, Int32(limit))
+        let pattern = "%\(query)%"
+        var index: Int32 = 1
+        for _ in 0..<3 {  // CASE expressions in the SELECT list bind first
+            bindText(stmt, index, pattern)
+            index += 1
+        }
+        for _ in 0..<3 {  // then the WHERE predicate
+            bindText(stmt, index, pattern)
+            index += 1
+        }
+        if let start {
+            bindText(stmt, index, start)
+            index += 1
+        }
+        if let end {
+            bindText(stmt, index, end)
+            index += 1
+        }
+        sqlite3_bind_int(stmt, index, Int32(limit))
 
         var results: [[String: Any]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
+            let matchSource = columnText(stmt, 6)
+            let text = columnText(stmt, 5)
+            let windowTitle = columnTextOrNull(stmt, 3) ?? ""
+            let appName = columnTextOrNull(stmt, 2) ?? ""
+
+            let matchedValue: String
+            switch matchSource {
+            case "text_content": matchedValue = text
+            case "window_title": matchedValue = windowTitle
+            case "app_name": matchedValue = appName
+            default: matchedValue = text
+            }
+
             results.append([
-                "captured_at": columnText(stmt, 0),
-                "app_name": columnTextOrNull(stmt, 1) ?? "",
-                "window_title": columnTextOrNull(stmt, 2) ?? "",
-                "source_type": columnText(stmt, 3),
-                "text": columnText(stmt, 6),
-                "match_source": columnText(stmt, 5),
-                "matched_value": matchedValue(stmt: stmt)
+                "id": columnText(stmt, 0),
+                "captured_at": columnText(stmt, 1),
+                "app_name": appName,
+                "window_title": windowTitle,
+                "source_type": columnText(stmt, 4),
+                "text": text.isEmpty ? (windowTitle.isEmpty ? appName : windowTitle) : text,
+                "match_source": matchSource,
+                "matched_value": matchedValue,
             ])
         }
+        return results
+    }
 
-        if results.isEmpty {
-            return "No matching activity found for '\(query)'."
+    /// Embed the query, or nil when the embed server is unreachable.
+    private func queryVector(_ query: String) async -> [Float]? {
+        do {
+            return try await SemanticSearch.embedQuery(query)
+        } catch {
+            fputs("[MCPServer] semantic search unavailable: \(error)\n", stderr)
+            return nil
         }
+    }
 
-        return prettyJSON(results)
+    /// Embedding similarity search, best-first. Empty when `vector` is nil (no
+    /// semantic ranking available) so callers degrade to keyword-only.
+    private func semanticMatches(
+        vector: [Float]?, limit: Int, start: String?, end: String?
+    ) async -> [[String: Any]] {
+        guard let vector else { return [] }
+
+        do {
+            let handle = db.handle
+            // Ranking scans every stored vector; run it off the actor so stdio
+            // requests stay responsive. The MCP database handle is read-only, so
+            // concurrent use is safe.
+            let matches = try await Task.detached(priority: .userInitiated) {
+                try SemanticSearch.search(
+                    handle: handle, query: vector, limit: limit,
+                    start: start, end: end
+                )
+            }.value
+
+            return matches.map { match in
+                [
+                    "id": match.eventID,
+                    "captured_at": match.capturedAt,
+                    "app_name": match.appName ?? "",
+                    "window_title": match.windowTitle ?? "",
+                    "source_type": match.sourceType,
+                    "text": match.text,
+                    "match_source": "semantic",
+                    // Round in the Double domain: rounding a Float leaves
+                    // 0.8080000281333923 in the JSON payload.
+                    "similarity": Double((match.similarity * 100).rounded()) / 100,
+                ]
+            }
+        } catch {
+            fputs("[MCPServer] semantic search failed: \(error)\n", stderr)
+            return []
+        }
     }
 
     private func getRecentActivity(minutes: Int) async throws -> String {
@@ -718,6 +953,18 @@ actor MCPServer {
 
 // MARK: - Helpers
 
+/// A result accumulated across the keyword and semantic rankings, carrying the
+/// fused score plus which sources surfaced it.
+private struct FusedHit {
+    var score: Double = 0
+    var payload: [String: Any]
+    var capturedAt: String = ""
+    var viaKeyword = false
+    var viaSemantic = false
+    var similarity: Double?
+    var keywordBoost: Double = 0
+}
+
 /// Read a non-null text column from a sqlite3 statement.
 private func columnText(_ stmt: OpaquePointer, _ idx: Int32) -> String {
     guard let ptr = sqlite3_column_text(stmt, idx) else { return "" }
@@ -728,20 +975,6 @@ private func columnText(_ stmt: OpaquePointer, _ idx: Int32) -> String {
 private func columnTextOrNull(_ stmt: OpaquePointer, _ idx: Int32) -> String? {
     guard let ptr = sqlite3_column_text(stmt, idx) else { return nil }
     return String(cString: ptr)
-}
-
-private func matchedValue(stmt: OpaquePointer) -> String {
-    let matchSource = columnText(stmt, 5)
-    switch matchSource {
-    case "text_content":
-        return columnText(stmt, 4)
-    case "window_title":
-        return columnTextOrNull(stmt, 2) ?? ""
-    case "app_name":
-        return columnTextOrNull(stmt, 1) ?? ""
-    default:
-        return columnText(stmt, 6)
-    }
 }
 
 private func bindText(_ stmt: OpaquePointer, _ idx: Int32, _ value: String) {

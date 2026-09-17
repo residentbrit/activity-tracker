@@ -68,11 +68,8 @@ You'll be prompted for:
     ┌──────────────▼──────────────┐
     │     MCP Server (stdio)       │
     │                              │
-    │  Tools: search_activities    │
-    │         get_recent_activity  │
-    │         list_sessions        │
-    │         get_session          │
-    │         get_sync_status      │
+    │  Tools: search, sessions,    │
+    │    meetings, sync (9 total)  │
     └──────────────┬──────────────┘
                    │
     ┌──────────────▼──────────────┐
@@ -94,6 +91,36 @@ Audio capture activates only when a meeting app is detected (Teams, Slack huddle
 
 All text is embedded on-device via llama.cpp + mxbai-embed-large. Nothing leaves your machine except during optional sync to your homellm instance.
 
+### Search: semantic, with keyword as a boost
+
+`search_activities` is hybrid. Embedding similarity does the ranking, and literal
+matches add a bounded boost on top:
+
+- **Semantic ranking** catches paraphrase. "writing a change ticket for production
+  deployment" matches nothing by `LIKE` — those words never appear in that order —
+  but returns the actual change-ticket conversations at 0.77–0.81 similarity.
+- **Literal boost** protects exact tokens. A ticket id should rank by verbatim
+  presence, not by embedding proximity, so a match adds +0.10 (single distinctive
+  token), +0.08 (window-title/app-name match) or +0.02 (a common word inside a large
+  OCR blob). Measured: an id present in 1,455 rows scored 0.68 against a
+  merely-similar screen at 0.75 — the boost has to exceed that gap to win.
+- **Similarity floor 0.62.** Calibrated against real data: genuine matches score
+  0.72–0.78 and unrelated content peaks near 0.60, so a query with no real answer
+  returns *nothing* rather than "least unrelated" noise.
+- **De-duplication.** One screen can produce hundreds of near-identical rows
+  (the same Slack window captured 5s apart), so results collapse on app +
+  first 200 characters of content.
+
+Fusion is additive rather than rank-based (RRF) on purpose: the semantic list is
+ordered by relevance, but a `LIKE` result set is ordered by recency, so its rank
+position carries no information — fusing by rank lets an arbitrary keyword match
+outrank a strong semantic one.
+
+If the embed server is down, search degrades to keyword-only and says so rather
+than reporting a false "no activity found". Ranking is a brute-force scan over
+every stored vector (~500ms at ~75k embedded rows, ~130ms when a time range
+narrows the set); there is no vector index.
+
 ## Querying your data
 
 Connect any MCP client to the stdio server:
@@ -109,6 +136,15 @@ Connect any MCP client to the stdio server:
 ```
 
 Then ask natural questions like "what did I work on yesterday?" or "summarize last week."
+
+| Tool | Answers |
+|---|---|
+| `search_activities` | Keyword + semantic search over captures, optionally bounded by `start`/`end` |
+| `get_recent_activity` | Captures from the last N minutes |
+| `get_activity_range` | Everything captured between two timestamps |
+| `list_sessions` / `get_session` | Session summaries, and every capture in one |
+| `list_meetings`, `get_meeting_transcript`, `search_transcripts` | Meeting transcripts |
+| `get_sync_status` | Sync backlog state |
 
 ## Watching it work
 
@@ -166,6 +202,8 @@ anyway (~4KB per row).
 
 1. TODO: add a per-app exclusion list before unattended always-on use, so sensitive apps and windows can be skipped.
 2. Slack answers are currently limited to what was actually visible on screen; channel-aware history would require a separate Slack API integration.
+3. Capture-time embedding is fire-and-forget: if an embed fails, the row stays unembedded. A 30-minute launchd sweep (`make embedbackfill-install`) drains them within half an hour, but the daemon itself still has no retry.
+4. The sync outbox grows unbounded unless `syncOutboxRetentionDays` is set — check `du -sh ~/.local/share/activity-tracker/sync-outbox/` if disk use matters.
 
 ## Configuration
 
@@ -179,13 +217,14 @@ anyway (~4KB per row).
   "audioMode": "meetings_only",
   "screenshotRetentionHours": 24,
   "syncIntervalMin": 30,
+  "syncOutboxRetentionDays": 0,
   "tier1PollIntervalSec": 5,
   "tier1BundleIDs": [
     "com.tinyspeck.slackmacgap",
     "com.microsoft.VSCode",
     "com.apple.Terminal",
     "com.google.Chrome",
-    "io.gitlab.librewolf-community",
+    "net.librewolf.librewolf",
     "com.microsoft.Outlook"
   ]
 }
@@ -193,9 +232,23 @@ anyway (~4KB per row).
 
 Changes take effect on SIGHUP — no restart needed.
 
+Note the LibreWolf bundle id: it is `net.librewolf.librewolf`, **not**
+`io.gitlab.librewolf-community`. With the wrong id LibreWolf is skipped by tier 1
+per-window polling and only captured on app switches (1 event/day instead of
+hundreds).
+
 ## Sync to homellm (optional)
 
-Events are exported as JSON to `~/.local/share/activity-tracker/sync-outbox/`. A companion script on the homellm machine can pick these up and push to pgvector for long-term history and annual summaries.
+Events are exported as JSON to `~/.local/share/activity-tracker/sync-outbox/`. A
+companion script on the homellm machine can pick these up and push to pgvector for
+long-term history and annual summaries.
+
+`synced = 1` on a row means *written to the outbox*, not *delivered* — nothing in
+this repo deletes or acknowledges outbox files, so they accumulate until something
+consumes them. Set `syncOutboxRetentionDays` to a positive number to prune files
+older than that many days; the default of `0` keeps everything.
+
+Duplicate rows are not exported, so the outbox carries one copy of any given screen.
 
 ## Tech stack
 

@@ -37,7 +37,7 @@ actor CaptureEngine {
     // AX-opaque apps that need pixel-diff instead of text-hash change detection
     private let axOpaqueBundleIDs: Set<String> = [
         "com.google.Chrome",
-        "io.gitlab.librewolf-community",
+        "net.librewolf.librewolf",   // LibreWolf — not io.gitlab.librewolf-community
         "org.mozilla.firefox",
         "com.microsoft.VSCode",   // editor pane is opaque
     ]
