@@ -1,5 +1,21 @@
 import Foundation
 
+/// Failures that should stop configuration loading outright, as opposed to a
+/// missing key (which keeps its default).
+enum ConfigError: LocalizedError {
+    case malformedJSON(String)
+    case notAnObject
+
+    var errorDescription: String? {
+        switch self {
+        case .malformedJSON(let detail):
+            return "config.json is not valid JSON: \(detail)"
+        case .notAnObject:
+            return "config.json must contain a JSON object at the top level"
+        }
+    }
+}
+
 /// Loaded from ~/.config/activity-tracker/config.json at startup.
 /// Reloadable on SIGHUP without restart.
 struct Config: Codable {
@@ -108,30 +124,74 @@ struct Config: Codable {
     /// Overlaying the file onto the encoded defaults means a key the file doesn't
     /// mention keeps its default, while everything present still wins.
     private static func decode(_ data: Data) throws -> Config {
+        // Parse the file first. A malformed file must fail loudly — `main` logs
+        // "config load failed" — rather than quietly reverting to defaults, which
+        // would look identical to "no config file" in the logs.
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ConfigError.malformedJSON(error.localizedDescription)
+        }
+        guard let fileObject = parsed as? [String: Any] else {
+            throw ConfigError.notAnObject
+        }
+
+        // An explicit null means "unset": `merge` skips nulls at every depth.
+        // Otherwise a null reaches the decoder, which rejects it for a
+        // non-optional property — so one `"password": null` would revert the
+        // entire config. Nested nulls count too: the top level alone is not enough.
+        let nulledKeys = nullPaths(in: fileObject)
+        if !nulledKeys.isEmpty {
+            fputs("[Config] null keys treated as absent: \(nulledKeys.joined(separator: ", "))\n", stderr)
+        }
+
         let defaultData = try JSONEncoder().encode(Config())
         guard let defaultObject = try JSONSerialization.jsonObject(with: defaultData) as? [String: Any] else {
             return try JSONDecoder().decode(Config.self, from: data)
         }
 
-        let override = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        if override.isEmpty {
-            fputs("[Config] warning: config file is not a JSON object — using defaults\n", stderr)
-        }
-
-        let absent = Set(defaultObject.keys).subtracting(override.keys).sorted()
+        let absent = Set(defaultObject.keys).subtracting(fileObject.keys).sorted()
         if !absent.isEmpty {
             fputs("[Config] absent keys keep their defaults: \(absent.joined(separator: ", "))\n", stderr)
         }
 
-        let merged = try JSONSerialization.data(withJSONObject: merge(defaultObject, override))
+        // Surface keys we don't recognise. There is no migration for a *renamed*
+        // setting: the old key stays in the file, the new property keeps its
+        // default, and the configured value is silently lost — so at least say so.
+        let unknown = Set(fileObject.keys).subtracting(defaultObject.keys).sorted()
+        if !unknown.isEmpty {
+            fputs("[Config] unrecognised keys ignored (renamed or typo?): \(unknown.joined(separator: ", "))\n", stderr)
+        }
+
+        let merged = try JSONSerialization.data(withJSONObject: merge(defaultObject, fileObject))
         return try JSONDecoder().decode(Config.self, from: merged)
+    }
+
+    /// Dotted paths of every null value in a config object, at any depth.
+    private static func nullPaths(in object: [String: Any], prefix: String = "") -> [String] {
+        var paths: [String] = []
+        for (key, value) in object {
+            let path = prefix.isEmpty ? key : "\(prefix).\(key)"
+            if value is NSNull {
+                paths.append(path)
+            } else if let child = value as? [String: Any] {
+                paths.append(contentsOf: nullPaths(in: child, prefix: path))
+            }
+        }
+        return paths.sorted()
     }
 
     /// Recursively overlay `override` onto `base`, so partially-specified nested
     /// objects (e.g. `syncTarget`) don't lose their defaults either.
+    ///
+    /// Nulls are skipped at every depth: the decoder rejects null for a
+    /// non-optional property, so dropping the key keeps the default instead of
+    /// failing the whole decode.
     private static func merge(_ base: [String: Any], _ override: [String: Any]) -> [String: Any] {
         var result = base
         for (key, value) in override {
+            if value is NSNull { continue }
             if let baseChild = result[key] as? [String: Any],
                let overrideChild = value as? [String: Any] {
                 result[key] = merge(baseChild, overrideChild)
