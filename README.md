@@ -144,7 +144,7 @@ Then ask natural questions like "what did I work on yesterday?" or "summarize la
 | `get_activity_range` | Everything captured between two timestamps |
 | `list_sessions` / `get_session` | Session summaries, and every capture in one |
 | `list_meetings`, `get_meeting_transcript`, `search_transcripts` | Meeting transcripts |
-| `get_sync_status` | Sync backlog state |
+| `get_sync_status` | Pipeline queue depths — awaiting embedding, awaiting push to pgvector |
 
 ## Watching it work
 

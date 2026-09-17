@@ -18,6 +18,11 @@ actor Embedder {
     private let maxEmbeddingChars = 1500
     private let maxEmbeddingWords = 200
 
+    /// Texts per batched request. The server tokenises each input separately but
+    /// rejects the whole request if any single input exceeds its 512-token
+    /// physical batch, so chunking keeps one bad row from failing a huge request.
+    private let maxBatchTexts = 64
+
     // Batch accumulator: texts waiting for the next drain cycle
     private var pending: [(text: String, continuation: CheckedContinuation<Data?, Never>)] = []
     private var drainTask: Task<Void, Never>?
@@ -114,19 +119,94 @@ actor Embedder {
     }
 
     private func drainViaServer(_ batch: [(String, CheckedContinuation<Data?, Never>)]) async {
-        log("[Embedder] batching \(batch.count) texts via server\n")
-        for (text, cont) in batch {
-            let result = await embedViaServer(text)
-            if result == nil {
-                serverFailureCount += 1
-                if serverFailureCount >= serverRetryAfterFailures {
-                    log("[Embedder] server failing repeatedly — will re-probe next batch\n")
-                    useServer = nil
-                }
-            } else {
-                serverFailureCount = 0
+        var start = 0
+        while start < batch.count {
+            let end = min(start + maxBatchTexts, batch.count)
+            await drainChunkViaServer(Array(batch[start..<end]))
+            start = end
+        }
+    }
+
+    private func drainChunkViaServer(_ chunk: [(String, CheckedContinuation<Data?, Never>)]) async {
+        let texts = chunk.map { $0.0 }
+
+        // One request for the whole chunk — the endpoint accepts an array and
+        // returns one vector per input, so N texts cost one round trip instead of
+        // N sequential POSTs. This is what the 30-minute sweep script already
+        // does; the live path used to send them one at a time.
+        if let vectors = await embedBatchViaServer(texts) {
+            log("[Embedder] batched \(texts.count) text(s) in one request\n")
+            for (offset, element) in chunk.enumerated() {
+                recordServerOutcome(succeeded: vectors[offset] != nil)
+                element.1.resume(returning: vectors[offset])
             }
-            cont.resume(returning: result)
+            return
+        }
+
+        // The chunk failed as a whole. Any single input over the server's
+        // 512-token physical batch rejects the entire request, so retry one at a
+        // time — that way one pathological row fails alone instead of taking its
+        // batch with it.
+        log("[Embedder] batch request failed — retrying \(texts.count) text(s) individually\n")
+        for (text, continuation) in chunk {
+            let result = await embedViaServer(text)
+            recordServerOutcome(succeeded: result != nil)
+            continuation.resume(returning: result)
+        }
+    }
+
+    /// Track health so a flapping server eventually triggers a re-probe.
+    private func recordServerOutcome(succeeded: Bool) {
+        if succeeded {
+            serverFailureCount = 0
+            return
+        }
+        serverFailureCount += 1
+        if serverFailureCount >= serverRetryAfterFailures {
+            log("[Embedder] server failing repeatedly — will re-probe next batch\n")
+            useServer = nil
+        }
+    }
+
+    /// POST every text in a single request.
+    ///
+    /// Returns nil when the request itself failed; individual entries are nil when
+    /// the server omitted that index (so callers can retry just those).
+    private func embedBatchViaServer(_ texts: [String]) async -> [Data?]? {
+        guard !texts.isEmpty else { return [] }
+        guard let url = URL(string: "\(serverURL)/v1/embeddings") else { return nil }
+
+        var req = URLRequest(url: url, timeoutInterval: 60)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "input": texts,
+            "model": "mxbai-embed-large",
+        ])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return nil
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let items = json["data"] as? [[String: Any]] else {
+                return nil
+            }
+
+            var vectors = [Data?](repeating: nil, count: texts.count)
+            for item in items {
+                guard let index = item["index"] as? Int,
+                      index >= 0, index < texts.count,
+                      let embedding = item["embedding"] as? [Double] else { continue }
+                let floats = embedding.map { Float($0) }
+                guard !floats.isEmpty else { continue }
+                vectors[index] = floats.withUnsafeBytes { Data($0) }
+            }
+            return vectors
+        } catch {
+            log("[Embedder] batch request failed: \(error)\n")
+            return nil
         }
     }
 

@@ -285,11 +285,28 @@ actor CaptureEngine {
 
         // 6. Embed asynchronously on a low-priority queue — never blocks capture
         let textToEmbedCopy = textToEmbed
+
+        // Nothing to embed for an empty capture (AX returned nothing and OCR found
+        // no text — ~5.9k such rows historically). `embed()` short-circuits on
+        // empty input and the embed sweep skips blank text, so reporting this as a
+        // failure would promise a retry that never comes.
+        guard !textToEmbedCopy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
         extractionQueue.async { [self] in
             Task {
-                let emb = await embedder.embed(textToEmbedCopy)
-                if let emb {
-                    try? await eventStore.updateEmbedding(eventId: eventId, embedding: emb)
+                guard let emb = await embedder.embed(textToEmbedCopy) else {
+                    // The row stays unembedded and the 30-minute embed sweep will
+                    // retry it. Logged rather than dropped silently: an invisible
+                    // failure here is exactly how the 56k backlog accumulated.
+                    log("[CaptureEngine] embedding failed for \(eventId) — left for the embed sweep\n")
+                    return
+                }
+                do {
+                    try await eventStore.updateEmbedding(eventId: eventId, embedding: emb)
+                } catch {
+                    log("[CaptureEngine] updateEmbedding failed for \(eventId): \(error)\n")
                 }
             }
         }

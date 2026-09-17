@@ -21,6 +21,15 @@ struct ActivityTracker {
         }
         log("config loaded")
 
+        // Log the effective values that are easy to get wrong, so a config that
+        // silently failed to load (or was overridden by defaults) is obvious from
+        // the startup log rather than hours later.
+        log("  heartbeat=\(config.heartbeatIntervalSec)s "
+            + "tier1=\(config.tier1BundleIDs.count) apps "
+            + "meetings=\(config.meetingBundleIDs.count) ids "
+            + "audio=\(config.audioMode.rawValue) "
+            + "outbox_retention=\(config.syncOutboxRetentionDays)d\n")
+
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)
         //    MCP-only mode opens read-only — it must never write or create the DB.
         log("opening database…")

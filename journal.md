@@ -964,6 +964,84 @@ the assertion forced the mapping to be explicit rather than assumed.
    `pg_synced` queue, then deleting the files.
 3. Audio segments have a `pg_synced` column and a remote table, but aren't pushed yet.
 
+---
+
+## 2026-09-17 (evening) — pipeline throughput, and a config regression I introduced
+
+### 1. The live embedder now actually batches
+
+`drainViaServer` accumulated texts for 3 seconds and then issued **one HTTP POST per
+text, sequentially**. The endpoint accepts an array and returns a vector per input —
+which the 30-minute sweep script already exploited, so the two paths disagreed and the
+hot path was the slow one. Now the accumulated chunk goes out as a single request
+(chunks of 64), with a per-text fallback if the request as a whole fails, since any
+single input over the server's 512-token physical batch rejects the entire request.
+
+Verified in the running daemon: `[Embedder] batched 5 text(s) in one request`.
+
+### 2. Embed failures are no longer silent
+
+The live path was `if let emb = ... { try? updateEmbedding }` — a failure left the row
+NULL with no log line at all, which is precisely how a 56k backlog grew unnoticed.
+Failures now log, and the `updateEmbedding` error is caught rather than `try?`-swallowed.
+
+**A follow-on mistake worth recording:** the first version of that log claimed
+"left for the embed sweep" for *every* nil result. Two rows tripped it, and the sweep
+then reported `failed=0, remaining=0` — because those rows had **empty** text (AX
+returned nothing), `embed()` short-circuits on empty input, and the sweep filters
+`LENGTH(text_content) > 0`. So the message promised a retry that could never happen.
+Now empty captures are skipped before dispatch (~5,900 such rows exist) and the log
+line only fires for genuine failures. Chasing this is what uncovered the config bug below.
+
+### 3. `get_sync_status` reports the real queues
+
+It reported only the legacy file export's `synced` count, which says nothing about
+whether recent activity is searchable. It now returns `embed_queue`, `ship_queue` and
+`legacy_outbox_queue` with a `queue_meaning` map, because "3,000 pending" is useless
+without knowing what the queue feeds.
+
+### 4. Config regression (mine) — and the fix
+
+Adding `syncOutboxRetentionDays` to `Config` **broke decoding of the existing config
+file**:
+
+```
+config load failed, using defaults: keyNotFound(... "syncOutboxRetentionDays" ...)
+```
+
+Swift's synthesised `Codable` throws on a missing key rather than falling back to the
+property's default value — property defaults only apply to the memberwise initialiser.
+The daemon logged one line and carried on with *all-default settings*, which meant the
+corrected `teams2` meeting bundle id and the 15s heartbeat were silently ignored for
+about five minutes until I noticed the log line by accident.
+
+Fixed by overlaying the file's JSON onto the encoded defaults (recursively, so a
+partially-specified `syncTarget` can't lose its defaults either) and logging which keys
+were absent. Also added a startup line with the effective values:
+
+```
+config loaded
+  heartbeat=15s tier1=6 apps meetings=4 ids audio=meetings_only outbox_retention=0d
+```
+
+That line is the real fix for the *class* of problem: the previous failure mode was
+invisible unless you happened to read one line of startup log. Verified against the
+live daemon — 15s and 4 meeting ids could only come from the config file, since the
+defaults are 30s and 3.
+
+Note the earlier attempt to prove this by heartbeat *cadence* was invalid: heartbeats
+measured 2/min both before and after, because a full-screen heartbeat capture is heavy
+enough that the effective period is ~30s regardless of a 15s timer. Measuring the
+config directly beat inferring it from behaviour.
+
+### 5. Key Lesson
+
+**Adding a field to a `Codable` config struct is a breaking change** unless decoding
+tolerates absent keys. The failure is silent, total (every setting reverts to defaults,
+not just the new one), and easy to miss. Anyone adding a config setting to this repo
+should add it to `Config` and rely on the defaulting decode — and check the startup log
+line, which now shows what actually loaded.
+
 ### 7. Key Lessons
 
 - **A missing row and a missing embedding look identical to a query.** Both produce

@@ -94,7 +94,52 @@ struct Config: Codable {
             return defaults
         }
         let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(Config.self, from: data)
+        return try decode(data)
+    }
+
+    /// Decode the config file *on top of* the built-in defaults.
+    ///
+    /// Swift's synthesised `Codable` throws `keyNotFound` for an absent key — it
+    /// does **not** fall back to the property's default value. So adding any new
+    /// setting silently invalidated every existing config file, and the daemon
+    /// started with all-default settings instead: it ignored the corrected
+    /// LibreWolf id and the teams2 meeting bundle id, among other things.
+    ///
+    /// Overlaying the file onto the encoded defaults means a key the file doesn't
+    /// mention keeps its default, while everything present still wins.
+    private static func decode(_ data: Data) throws -> Config {
+        let defaultData = try JSONEncoder().encode(Config())
+        guard let defaultObject = try JSONSerialization.jsonObject(with: defaultData) as? [String: Any] else {
+            return try JSONDecoder().decode(Config.self, from: data)
+        }
+
+        let override = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if override.isEmpty {
+            fputs("[Config] warning: config file is not a JSON object — using defaults\n", stderr)
+        }
+
+        let absent = Set(defaultObject.keys).subtracting(override.keys).sorted()
+        if !absent.isEmpty {
+            fputs("[Config] absent keys keep their defaults: \(absent.joined(separator: ", "))\n", stderr)
+        }
+
+        let merged = try JSONSerialization.data(withJSONObject: merge(defaultObject, override))
+        return try JSONDecoder().decode(Config.self, from: merged)
+    }
+
+    /// Recursively overlay `override` onto `base`, so partially-specified nested
+    /// objects (e.g. `syncTarget`) don't lose their defaults either.
+    private static func merge(_ base: [String: Any], _ override: [String: Any]) -> [String: Any] {
+        var result = base
+        for (key, value) in override {
+            if let baseChild = result[key] as? [String: Any],
+               let overrideChild = value as? [String: Any] {
+                result[key] = merge(baseChild, overrideChild)
+            } else {
+                result[key] = value
+            }
+        }
+        return result
     }
 
     func write() throws {

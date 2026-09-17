@@ -161,7 +161,7 @@ actor MCPServer {
             ],
             [
                 "name": "get_sync_status",
-                "description": "Check sync status — how many events are pending push to homellm, and when the last sync occurred.",
+                "description": "Check the capture pipeline's queues: events awaiting embedding (invisible to semantic search until embedded), events awaiting push to homellm pgvector, and the last file-export time.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [:]
@@ -689,15 +689,39 @@ actor MCPServer {
         return prettyJSON(results)
     }
 
+    /// Report the pipeline's real queues.
+    ///
+    /// There are three stages, each marked by its own column, and reporting only
+    /// the legacy file export (as this used to) says nothing about whether
+    /// recently captured activity is actually searchable yet.
+    ///   * `embedding IS NULL` — captured but not yet embedded (live embedder +
+    ///     30-minute sweep). While this is non-zero, semantic search cannot see
+    ///     those rows even though they exist.
+    ///   * `pg_synced = 0`     — embedded but not yet pushed to homellm pgvector.
+    ///   * `synced = 0`        — legacy: not yet written to the file outbox.
     private func getSyncStatus() async -> String {
-        let count = (try? await eventStore.unsyncedCount()) ?? 0
-        let sql = "SELECT started_at, status FROM sync_log ORDER BY id DESC LIMIT 1"
-        let row = db.queryOne(sql)
-
         let status: [String: Any] = [
-            "unsynced_events": count,
-            "last_sync_at": row?[0] ?? NSNull(),
-            "last_sync_status": row?[1] ?? "never"
+            "embed_queue": countRows(
+                "SELECT COUNT(*) FROM events WHERE embedding IS NULL AND is_duplicate = 0 "
+                + "AND LENGTH(COALESCE(text_content, '')) > 0"
+            ),
+            "ship_queue": countRows(
+                "SELECT COUNT(*) FROM events WHERE pg_synced = 0 AND is_duplicate = 0"
+            ),
+            "legacy_outbox_queue": countRows(
+                "SELECT COUNT(*) FROM events WHERE synced = 0 AND is_duplicate = 0"
+            ),
+            "queue_meaning": [
+                "embed_queue": "awaiting embedding — invisible to semantic search",
+                "ship_queue": "awaiting push to homellm pgvector (`make sync-pgvector`)",
+                "legacy_outbox_queue": "awaiting the retired file export; safe to ignore",
+            ],
+            "last_file_export_at": db.queryOne(
+                "SELECT started_at FROM sync_log ORDER BY id DESC LIMIT 1"
+            )?.first ?? NSNull(),
+            "last_file_export_status": db.queryOne(
+                "SELECT status FROM sync_log ORDER BY id DESC LIMIT 1"
+            )?.first ?? "never",
         ]
 
         if let data = try? JSONSerialization.data(withJSONObject: status, options: .prettyPrinted),
@@ -705,6 +729,11 @@ actor MCPServer {
             return text
         }
         return "Could not retrieve sync status."
+    }
+
+    private func countRows(_ sql: String) -> Int {
+        guard let row = db.queryOne(sql), let value = row.first ?? nil else { return 0 }
+        return Int(value) ?? 0
     }
 
     private func listSessions(date: String?, machineId: String?) async throws -> String {
