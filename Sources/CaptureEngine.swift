@@ -20,6 +20,9 @@ actor CaptureEngine {
 
     private var currentSession: Session?
     private var isIdle = false
+    /// Non-nil while capture is suppressed because the display is asleep or the
+    /// session is locked. Tracked so the log fires on transitions, not per attempt.
+    private var suspension: CaptureSuspension?
     private var heartbeatTask: Task<Void, Never>?
     private var tier1Task: Task<Void, Never>?
     private var retentionTask: Task<Void, Never>?
@@ -139,7 +142,35 @@ actor CaptureEngine {
         startTimers()
     }
 
+    /// The reason capture is currently suppressed, or nil when a user may be
+    /// present. Logs only on transitions, so a suspended night is one line
+    /// rather than one per heartbeat.
+    private func checkSuspension() -> CaptureSuspension? {
+        let current = DisplayState.suspensionReason()
+        if current != suspension {
+            if let current {
+                log("[CaptureEngine] capture suspended — \(current.rawValue)\n")
+            } else {
+                log("[CaptureEngine] capture resumed — display awake, session unlocked\n")
+            }
+            suspension = current
+        }
+        return current
+    }
+
     private func fireHeartbeat() async {
+        // A sleeping display cannot be captured — CGWindowListCreateImage
+        // returns nil — so skip the attempt entirely rather than logging a
+        // failure and discarding the capture. Measured 2026-09-17: 232 failures
+        // per hour for seven consecutive hours, writing zero rows. The session
+        // is closed here so the gap appears as a session boundary instead of
+        // looking like continuous activity.
+        if checkSuspension() != nil {
+            if currentSession != nil {
+                await closeCurrentSession()
+            }
+            return
+        }
         if !isIdle {
             log("[CaptureEngine] heartbeat firing\n")
             await capture(trigger: "heartbeat")
@@ -164,6 +195,12 @@ actor CaptureEngine {
     }
 
     private func capture(trigger: String) async {
+        // Choke point for every trigger — heartbeat, app switch, window title,
+        // typing pause. A sleeping display or a locked session makes
+        // CGWindowListCreateImage return nil, which the caller would discard
+        // anyway, so don't start the work.
+        guard checkSuspension() == nil else { return }
+
         log("[CaptureEngine] capture(\(trigger)) starting\n")
 
         // Ensure session exists
@@ -181,7 +218,17 @@ actor CaptureEngine {
         } else {
             image = await captureFrontmostWindow()
         }
-        guard let image else { return }
+        guard let image else {
+            // Separate the expected case from the alarming one: a display that
+            // slept between the check above and this call is normal, anything
+            // else means capture is genuinely broken and needs looking at.
+            if let reason = DisplayState.suspensionReason() {
+                log("[CaptureEngine] capture(\(trigger)) skipped — \(reason.rawValue)\n")
+            } else {
+                log("[CaptureEngine] capture(\(trigger)) produced no image\n")
+            }
+            return
+        }
 
         // 2. Write to DB immediately (fast — don't block on extraction)
         let eventId = UUID().uuidString

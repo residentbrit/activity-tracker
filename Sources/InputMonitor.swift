@@ -212,12 +212,26 @@ final class InputMonitor: @unchecked Sendable {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
 
-            let effectiveIdle = Self.systemIdleTime()
+            let hidIdle = Self.systemIdleTime()
             let idleThreshold = Double(self.config.idleTimeoutMin * 60)
+
+            // A sleeping display or a locked session means nobody is at the
+            // machine, whatever HIDIdleTime claims. Measured 2026-09-17:
+            // HIDIdleTime stayed below the threshold for seven hours with the
+            // display off, so isIdle never became true and the heartbeat ran at
+            // full rate all night, failing every capture.
+            let suspension = DisplayState.suspensionReason()
+            let effectiveIdle = suspension != nil ? max(hidIdle, idleThreshold) : hidIdle
 
             if effectiveIdle >= idleThreshold {
                 if !self.isIdle {
                     self.isIdle = true
+                    if let suspension, hidIdle < idleThreshold {
+                        // The two idle sources disagree. Worth surfacing,
+                        // because this disagreement silently defeated idle
+                        // detection for seven hours.
+                        log("[InputMonitor] idle forced by \(suspension.rawValue) (HIDIdleTime=\(Int(hidIdle))s)\n")
+                    }
                     self.onEvent?(.idleTimeout)
                 }
             } else if self.isIdle {

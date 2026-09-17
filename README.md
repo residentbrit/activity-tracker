@@ -62,7 +62,7 @@ You'll be prompted for:
 │  Content change detection: AX text-hash (fast) or      │
 │       pixel-diff thumbnail for AX-opaque apps          │
 │  Text diffing: embed only new lines since last capture │
-│  Idle: pauses after 5min of no input                   │
+│  Idle: pauses after 5min, or display asleep/locked     │
 └──────────────────┬───────────────────────────────────┘
                    │
     ┌──────────────▼──────────────┐
@@ -378,6 +378,7 @@ Sources/
 ├── Database.swift          SQLite + migrations
 ├── CaptureEngine.swift     Screen capture + session lifecycle
 ├── InputMonitor.swift      CGEvent tap, idle detection, typing pause
+├── DisplayState.swift      Display-sleep / screen-lock detection
 ├── TextExtractor.swift     AX-first, Vision OCR fallback
 ├── Embedder.swift          llama.cpp subprocess
 ├── MeetingDetector.swift   Bundle ID + window-title heuristics
