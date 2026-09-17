@@ -207,35 +207,91 @@ anyway (~4KB per row).
 
 ## Configuration
 
-`~/.config/activity-tracker/config.json` (auto-generated on first run):
+`~/.config/activity-tracker/config.json` is written automatically on first run. You
+never need to create it, and the defaults work as-is — edit it only to change
+behaviour. This is the complete set of keys it writes (`/Users/you` stands in for your
+home directory):
 
 ```json
 {
-  "heartbeatIntervalSec": 30,
-  "typingPauseSec": 3,
-  "idleTimeoutMin": 5,
-  "audioMode": "meetings_only",
-  "screenshotRetentionHours": 24,
-  "syncIntervalMin": 30,
-  "syncOutboxRetentionDays": 0,
-  "tier1PollIntervalSec": 5,
-  "tier1BundleIDs": [
+  "audioMode" : "meetings_only",
+  "dbPath" : "/Users/you/.local/share/activity-tracker/activity.db",
+  "embeddingBinaryPath" : "/Users/you/.local/bin/llama-embedding",
+  "embeddingModel" : "mxbai-embed-large",
+  "embeddingModelPath" : "/Users/you/.local/share/activity-tracker/models/",
+  "heartbeatIntervalSec" : 30,
+  "idleTimeoutMin" : 5,
+  "meetingBundleIDs" : [
+    "com.microsoft.teams",
+    "com.tinyspeck.slackmacgap",
+    "us.zoom.xos"
+  ],
+  "meetingWindowTitlePatterns" : [
+    "huddle"
+  ],
+  "screenshotRetentionHours" : 24,
+  "syncIntervalMin" : 30,
+  "syncOutboxRetentionDays" : 0,
+  "syncTarget" : {
+    "database" : "phillip_ai",
+    "host" : "192.168.1.33",
+    "password" : "",
+    "port" : 5433,
+    "user" : "activity_tracker"
+  },
+  "tier1BundleIDs" : [
     "com.tinyspeck.slackmacgap",
     "com.microsoft.VSCode",
     "com.apple.Terminal",
     "com.google.Chrome",
     "net.librewolf.librewolf",
     "com.microsoft.Outlook"
-  ]
+  ],
+  "tier1PollIntervalSec" : 5,
+  "typingPauseSec" : 3,
+  "whisperBinaryPath" : "/Users/you/.local/bin/whisper-cli",
+  "whisperModel" : "small"
 }
 ```
 
 Changes take effect on SIGHUP — no restart needed.
 
-Note the LibreWolf bundle id: it is `net.librewolf.librewolf`, **not**
-`io.gitlab.librewolf-community`. With the wrong id LibreWolf is skipped by tier 1
-per-window polling and only captured on app switches (1 event/day instead of
-hundreds).
+### Editing it safely
+
+- **Keys you omit keep their defaults**, so a config file doesn't need updating when the
+  schema grows. Absent keys, unknown keys and `null` values are all reported at startup.
+- A malformed file or a wrong-typed value is reported rather than silently ignored — but
+  note the daemon then falls back to *all* defaults, so check the line below if
+  behaviour changes unexpectedly.
+- To see what actually took effect:
+
+  ```bash
+  grep -A2 'loading config' ~/.local/share/activity-tracker/logs/collector-error.log
+  #   config loaded
+  #     heartbeat=15s tier1=6 apps meetings=4 ids audio=meetings_only outbox_retention=0d
+  ```
+
+### The two settings that fail quietly: bundle ids
+
+Getting a bundle id wrong doesn't error — capture keeps running, just degraded, with
+nothing in the logs. Both of these have bitten before:
+
+| Setting | Correct value | With the wrong value |
+|---|---|---|
+| `tier1BundleIDs` | `net.librewolf.librewolf` | LibreWolf is skipped by tier 1 per-window polling — ~1 event/day instead of hundreds. **Not** `io.gitlab.librewolf-community`. |
+| `meetingBundleIDs` | `com.microsoft.teams2` | Meetings are never detected, so no transcripts at all. `com.microsoft.teams` is *classic* Teams only. |
+
+Check an installed app's real id with:
+
+```bash
+osascript -e 'id of app "Microsoft Teams"'
+```
+
+### Settings that delete data
+
+`screenshotRetentionHours` (screenshots) and `syncOutboxRetentionDays` (sync export
+files) are the only two settings that remove anything. `0` for the latter means keep
+everything. `audioMode: "off"` disables meeting capture entirely.
 
 ## Sync to homellm (optional)
 
@@ -320,8 +376,12 @@ Sources/
 ├── MeetingDetector.swift   Bundle ID + window-title heuristics
 ├── AudioCapture.swift      AVFoundation + VAD + whisper.cpp
 ├── EventStore.swift        Prepared-statement CRUD
-├── MCPServer.swift         JSON-RPC stdio server (5 tools)
-├── SyncEngine.swift        File-based sync export
-└── Resources/
-    └── config.default.json
+├── MCPServer.swift         JSON-RPC stdio server (9 tools)
+├── SemanticSearch.swift    Embedding similarity search (hybrid ranking)
+└── SyncEngine.swift        File-based sync export (legacy — see pgvector sync)
+
+scripts/
+├── harvest_vscode_chat.py  Copilot chat transcripts → events
+├── backfill_embeddings.py  Fill missing embeddings (batched, resumable)
+└── sync_to_pgvector.py     Local SQLite → homellm pgvector
 ```

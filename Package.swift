@@ -16,9 +16,6 @@ let package = Package(
             name: "ActivityTracker",
             dependencies: [],
             path: "Sources",
-            resources: [
-                .copy("Resources/config.default.json")
-            ],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
             ]
