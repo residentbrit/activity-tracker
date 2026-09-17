@@ -29,7 +29,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install harvest-chat harvest-install harvest-embed
+.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install harvest-chat harvest-install harvest-embed embedbackfill-install
 
 all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 	@echo ""
@@ -72,9 +72,11 @@ daemon-uninstall:
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist || true
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist || true
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist || true
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.embedbackfill.plist || true
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.embedserver.plist
 	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.harvest.plist
+	rm -f $(HOME)/Library/LaunchAgents/com.activitytracker.embedbackfill.plist
 	@echo "==> Daemons stopped and removed"
 
 embedserver-install: install
@@ -115,6 +117,23 @@ harvest-install:
 	@echo "==> Chat harvest job installed (runs hourly)"
 	@echo "    Manual run:  make harvest-chat"
 	@echo "    Embed after: make harvest-embed"
+
+# --- Self-healing embedding sweep ---
+# Capture-time embedding is fire-and-forget: if an embed fails (server busy,
+# oversized input, process restart) the row stays unembedded and search silently
+# misses it. This sweep drains whatever accumulates, so the backlog can't grow
+# unattended. Runs in the existing launchd job rather than inside the daemon, so
+# there is no binary rebuild and no TCC re-grant.
+
+embedbackfill-install:
+	mkdir -p $(HOME)/.local/share/activity-tracker/logs
+	sed 's|%HOME%|$(HOME)|g' launchd/com.activitytracker.embedbackfill.plist > $(HOME)/Library/LaunchAgents/com.activitytracker.embedbackfill.plist
+	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.embedbackfill.plist 2>/dev/null || true
+	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.embedbackfill.plist
+	@echo ""
+	@echo "==> Embedding sweep installed (runs every 30 min)"
+	@echo "    Monitor: tail -f $(HOME)/.local/share/activity-tracker/logs/embedbackfill.log"
+	@echo "    Manual:  make backfill"
 
 # --- Swift binary ---
 

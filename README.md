@@ -132,6 +132,14 @@ If older rows were captured before embedding fixes, run a one-shot backfill:
 make backfill
 ```
 
+Rows are embedded through the resident `llama-server` in batches of 32 — the same
+endpoint the daemon uses, so vectors are identical to live captures and no model
+is reloaded per row. If the server is unreachable the script falls back to
+`llama-embedding` subprocesses.
+
+Inputs that exceed the server's 512-token batch are retried with progressively
+smaller word and character caps (token-dense lists and long URLs both trip this).
+
 Advanced options:
 
 ```bash
@@ -141,9 +149,18 @@ Advanced options:
 # Process only a subset
 ./scripts/backfill_embeddings.py --limit 100
 
-# Include duplicate rows too
+# Include duplicate rows too (skipped by default — see note below)
 ./scripts/backfill_embeddings.py --include-duplicates
+
+# Force the slow subprocess path, or tune server batching
+./scripts/backfill_embeddings.py --no-server
+./scripts/backfill_embeddings.py --batch-size 64
 ```
+
+Note: duplicate rows (`is_duplicate = 1`) are deliberately inserted without an
+embedding — they repeat text that is already embedded on the row that introduced
+it, so semantic search finds the original. `--include-duplicates` embeds them
+anyway (~4KB per row).
 
 ## Known gaps
 

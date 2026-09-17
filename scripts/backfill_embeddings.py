@@ -2,7 +2,13 @@
 """One-shot embedding backfill for Activity Tracker SQLite events.
 
 Embeds non-duplicate rows that have text but no embedding yet.
-Uses llama-embedding in JSON output mode for robust parsing.
+
+Two execution modes:
+  * **server** (default) — batches texts to the resident ``llama-server`` on
+    port 8080 (the same endpoint the daemon uses), so vectors are byte-identical
+    to live captures and no model reload happens per row.
+  * **subprocess** — falls back to ``llama-embedding`` (JSON output mode)
+    when the server is unreachable.
 """
 
 from __future__ import annotations
@@ -15,6 +21,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -36,6 +44,8 @@ class BackfillConfig:
     include_duplicates: bool
     limit: Optional[int]
     dry_run: bool
+    server_url: Optional[str] = None
+    batch_size: int = 32
 
 
 def prepare_text(text: str, max_chars: int, max_words: int) -> str:
@@ -126,6 +136,183 @@ def embed_json(text: str, cfg: BackfillConfig) -> tuple[Optional[bytes], Optiona
     return struct.pack("<1024f", *values), None
 
 
+def server_healthy(url: str, timeout: float = 2.0) -> bool:
+    """True when llama-server answers /health with 200."""
+    try:
+        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def embed_batch_via_server(
+    texts: list[str], url: str, timeout: int
+) -> tuple[list[Optional[bytes]], Optional[str]]:
+    """Embed a batch of texts through llama-server's OpenAI-compatible endpoint.
+
+    Returns (blobs, error) where blobs[i] corresponds to texts[i]; a None entry
+    means that individual item failed.
+    """
+    endpoint = f"{url.rstrip('/')}/v1/embeddings"
+    body = json.dumps({"input": texts, "model": "mxbai-embed-large"}).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint, data=body, headers={"Content-Type": "application/json"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        return [None] * len(texts), f"server_error:{exc}"
+
+    items = payload.get("data")
+    if not isinstance(items, list):
+        return [None] * len(texts), "missing_data"
+
+    blobs: list[Optional[bytes]] = [None] * len(texts)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        emb = item.get("embedding")
+        if not isinstance(idx, int) or not isinstance(emb, list):
+            continue
+        if idx < 0 or idx >= len(texts):
+            continue
+        try:
+            values = [float(x) for x in emb]
+        except Exception:
+            continue
+        if len(values) < 1024:
+            continue
+        blobs[idx] = struct.pack("<1024f", *values[-1024:])
+
+    return blobs, None
+
+
+def shrink_variants(text: str, cfg: BackfillConfig) -> list[str]:
+    """Progressively smaller variants of `text`, for retrying over token limits.
+
+    Two axes are needed. Word caps handle token-dense prose (ID/hostname lists),
+    while character caps handle single enormous "words" — an 800-char SAML URL is
+    one whitespace-separated word but hundreds of tokens.
+    """
+    variants: list[str] = []
+    word_count = len(text.split())
+    for words_cap in (100, 60, 30, 15):
+        if words_cap >= word_count:
+            continue
+        variants.append(prepare_text(text, cfg.max_chars, words_cap))
+    for chars_cap in (600, 300, 150, 75):
+        if chars_cap >= len(text):
+            continue
+        variants.append(prepare_text(text, chars_cap, cfg.max_words))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        if variant and variant not in seen:
+            seen.add(variant)
+            unique.append(variant)
+    return unique
+
+
+def embed_one_via_server(
+    text: str, url: str, cfg: BackfillConfig
+) -> tuple[Optional[bytes], Optional[str]]:
+    """Embed a single text, shrinking the input if the server rejects it.
+
+    llama-server returns HTTP 500 ("input (N tokens) is too large to process")
+    when the tokenized input exceeds its 512-token physical batch — the same
+    failure mode as llama-embedding's rc:-6 SIGABRT in subprocess mode.
+    """
+    blobs, err = embed_batch_via_server([text], url, cfg.timeout_sec)
+    if blobs and blobs[0] is not None:
+        return blobs[0], None
+
+    for variant in shrink_variants(text, cfg):
+        blobs, err = embed_batch_via_server([variant], url, cfg.timeout_sec)
+        if blobs and blobs[0] is not None:
+            return blobs[0], None
+
+    return None, err
+
+
+def embed_rows_via_server(
+    conn: sqlite3.Connection,
+    cur: sqlite3.Cursor,
+    prepared_rows: list[tuple[str, str]],
+    cfg: BackfillConfig,
+) -> tuple[int, int]:
+    """Embed rows in server batches. Returns (embedded, failed)."""
+    embedded = 0
+    failed = 0
+    total = len(prepared_rows)
+    url = cfg.server_url or ""
+
+    for start in range(0, total, cfg.batch_size):
+        chunk = prepared_rows[start : start + cfg.batch_size]
+        blobs, err = embed_batch_via_server(
+            [text for _, text in chunk], url, cfg.timeout_sec
+        )
+
+        for (event_id, text), blob in zip(chunk, blobs):
+            if blob is None:
+                # Any oversized input fails the whole request, so a failed item
+                # is retried alone (and shrunk) rather than sinking its batch.
+                blob, item_err = embed_one_via_server(text, url, cfg)
+                if blob is None:
+                    failed += 1
+                    print(f"{event_id} failed {item_err or err}", file=sys.stderr)
+                    continue
+
+            cur.execute("UPDATE events SET embedding = ? WHERE id = ?", (blob, event_id))
+            embedded += 1
+
+        conn.commit()
+        done = min(start + cfg.batch_size, total)
+        print(f"[{done}/{total}] embedded={embedded} failed={failed}")
+
+    return embedded, failed
+
+
+def embed_rows_via_subprocess(
+    conn: sqlite3.Connection,
+    cur: sqlite3.Cursor,
+    prepared_rows: list[tuple[str, str]],
+    cfg: BackfillConfig,
+) -> tuple[int, int]:
+    """Embed rows one subprocess at a time. Returns (embedded, failed)."""
+    embedded = 0
+    failed = 0
+    total = len(prepared_rows)
+
+    for idx, (event_id, prepared) in enumerate(prepared_rows, start=1):
+        blob, err = embed_json(prepared, cfg)
+        if blob is None:
+            # llama-embedding SIGABRTs (rc:-6) when the tokenized input exceeds
+            # its batch size; shrink and retry.
+            for variant in shrink_variants(prepared, cfg):
+                blob, err = embed_json(variant, cfg)
+                if blob is not None:
+                    break
+
+        if blob is None:
+            failed += 1
+            print(f"[{idx}/{total}] {event_id} failed {err}", file=sys.stderr)
+            continue
+
+        cur.execute("UPDATE events SET embedding = ? WHERE id = ?", (blob, event_id))
+        embedded += 1
+
+        if embedded % 10 == 0:
+            conn.commit()
+            print(f"[{idx}/{total}] embedded={embedded} failed={failed}")
+
+    conn.commit()
+    return embedded, failed
+
+
 def build_select_sql(include_duplicates: bool, limit: Optional[int], trigger: Optional[str] = None) -> str:
     where_dups = "1=1" if include_duplicates else "is_duplicate = 0"
     trigger_clause = f" AND trigger = '{trigger}'" if trigger else ""
@@ -145,12 +332,21 @@ def run(cfg: BackfillConfig) -> int:
     if not os.path.exists(cfg.db_path):
         print(f"error: db not found at {cfg.db_path}", file=sys.stderr)
         return 2
-    if not os.path.isfile(cfg.embedding_bin) or not os.access(cfg.embedding_bin, os.X_OK):
-        print(f"error: embedding binary not executable at {cfg.embedding_bin}", file=sys.stderr)
-        return 2
     if not os.path.exists(cfg.model_path):
         print(f"error: model not found at {cfg.model_path}", file=sys.stderr)
         return 2
+
+    # Prefer the resident embed server — same endpoint the daemon uses, so the
+    # vectors are identical and no model is reloaded per row.
+    use_server = bool(cfg.server_url) and server_healthy(cfg.server_url)
+    if use_server:
+        print(f"mode: server {cfg.server_url} (batch size {cfg.batch_size})")
+    else:
+        if cfg.server_url:
+            print(f"mode: subprocess (embed server unreachable at {cfg.server_url})")
+        if not os.path.isfile(cfg.embedding_bin) or not os.access(cfg.embedding_bin, os.X_OK):
+            print(f"error: embedding binary not executable at {cfg.embedding_bin}", file=sys.stderr)
+            return 2
 
     conn = sqlite3.connect(cfg.db_path)
     conn.execute("PRAGMA busy_timeout=5000")
@@ -167,63 +363,48 @@ def run(cfg: BackfillConfig) -> int:
 
     print(f"Backfilling {total} rows...")
 
+    prepared_rows: list[tuple[str, str]] = []
+    skipped_empty = 0
+    for event_id, text in rows:
+        prepared = prepare_text(text, cfg.max_chars, cfg.max_words)
+        if not prepared:
+            skipped_empty += 1
+            continue
+        prepared_rows.append((event_id, prepared))
+
+    if not prepared_rows:
+        print("No rows with embeddable text.")
+        conn.close()
+        return 0
+
     embedded = 0
     failed = 0
 
-    for idx, (event_id, text) in enumerate(rows, start=1):
-        prepared = prepare_text(text, cfg.max_chars, cfg.max_words)
-        if not prepared:
-            failed += 1
-            print(f"[{idx}/{total}] {event_id} skipped_empty")
-            continue
+    if cfg.dry_run:
+        for event_id, _ in prepared_rows:
+            print(f"{event_id} would_embed")
+        embedded = len(prepared_rows)
+    elif use_server:
+        embedded, failed = embed_rows_via_server(conn, cur, prepared_rows, cfg)
+    else:
+        embedded, failed = embed_rows_via_subprocess(conn, cur, prepared_rows, cfg)
 
-        blob, err = embed_json(prepared, cfg)
-        if blob is None and err == "rc:-6":
-            # llama-embedding SIGABRTs when the tokenized input exceeds its
-            # batch size. Token count is a poor match for word count on
-            # token-dense text (ID/hostname lists), so shrink progressively
-            # until it fits.
-            word_count = len(prepared.split())
-            for words_cap in (100, 60, 30, 15):
-                if words_cap >= word_count:
-                    continue
-                prepared = prepare_text(prepared, cfg.max_chars, words_cap)
-                blob, err = embed_json(prepared, cfg)
-                if blob is not None or err != "rc:-6":
-                    break
-
-        if blob is None:
-            failed += 1
-            print(f"[{idx}/{total}] {event_id} failed {err}")
-            continue
-
-        if cfg.dry_run:
-            print(f"[{idx}/{total}] {event_id} would_embed")
-            embedded += 1
-            continue
-
-        cur.execute("UPDATE events SET embedding = ? WHERE id = ?", (blob, event_id))
-        embedded += 1
-        print(f"[{idx}/{total}] {event_id} embedded")
-
-        if embedded % 10 == 0:
-            conn.commit()
-
-    if not cfg.dry_run:
-        conn.commit()
-
-    remaining_sql = (
-        "SELECT COUNT(*) FROM events WHERE embedding IS NULL "
-        "AND COALESCE(LENGTH(text_content), 0) > 0 "
-        + ("" if cfg.include_duplicates else "AND is_duplicate = 0")
-    )
-    remaining = cur.execute(remaining_sql).fetchone()[0]
+    if cfg.dry_run:
+        remaining = -1
+    else:
+        remaining_sql = (
+            "SELECT COUNT(*) FROM events WHERE embedding IS NULL "
+            "AND COALESCE(LENGTH(text_content), 0) > 0 "
+            + ("" if cfg.include_duplicates else "AND is_duplicate = 0")
+        )
+        remaining = cur.execute(remaining_sql).fetchone()[0]
 
     conn.close()
 
     print(
         "backfill_done "
-        f"embedded={embedded} failed={failed} total={total} remaining={remaining} "
+        f"embedded={embedded} failed={failed} skipped_empty={skipped_empty} "
+        f"total={total} remaining={remaining} "
         f"dry_run={str(cfg.dry_run).lower()}"
     )
 
@@ -241,6 +422,13 @@ def parse_args() -> BackfillConfig:
     p.add_argument("--include-duplicates", action="store_true", help="Also embed duplicate rows")
     p.add_argument("--limit", type=int, default=None, help="Max rows to process")
     p.add_argument("--trigger", default=None, help="Only embed events with this trigger value (e.g. screenpipe_import)")
+    p.add_argument(
+        "--server-url",
+        default="http://127.0.0.1:8080",
+        help="llama-server base URL for batched embedding (default: %(default)s)",
+    )
+    p.add_argument("--no-server", action="store_true", help="Always use the llama-embedding subprocess")
+    p.add_argument("--batch-size", type=int, default=32, help="Texts per server request (default: %(default)s)")
     p.add_argument("--dry-run", action="store_true", help="Do not update DB")
     args = p.parse_args()
 
@@ -254,6 +442,8 @@ def parse_args() -> BackfillConfig:
         include_duplicates=args.include_duplicates,
         limit=args.limit,
         dry_run=args.dry_run,
+        server_url=None if args.no_server else args.server_url,
+        batch_size=max(1, args.batch_size),
     )
     cfg.trigger = args.trigger
     return cfg
