@@ -141,6 +141,18 @@ final class Database {
             """)
             try execute("INSERT INTO schema_version(version) VALUES (2)")
         }
+
+        if current < 3 {
+            // v3: queue flag for the direct pgvector push (scripts/sync_to_pgvector.py).
+            //
+            // Deliberately separate from `synced`, which the file-based outbox
+            // export sets. Sharing one flag would mean whichever mechanism ran
+            // first marked rows as done and silently starved the other.
+            try execute("ALTER TABLE events ADD COLUMN pg_synced INTEGER DEFAULT 0")
+            try execute("ALTER TABLE audio_segments ADD COLUMN pg_synced INTEGER DEFAULT 0")
+            try execute("CREATE INDEX IF NOT EXISTS idx_events_pg_synced ON events(pg_synced)")
+            try execute("INSERT INTO schema_version(version) VALUES (3)")
+        }
     }
 
     // MARK: - Raw execution

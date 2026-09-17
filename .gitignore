@@ -12,3 +12,4 @@ activity.db-shm
 error.log
 __pycache__/
 *.pyc
+.venv/

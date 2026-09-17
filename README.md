@@ -239,14 +239,56 @@ hundreds).
 
 ## Sync to homellm (optional)
 
-Events are exported as JSON to `~/.local/share/activity-tracker/sync-outbox/`. A
-companion script on the homellm machine can pick these up and push to pgvector for
-long-term history and annual summaries.
+Local SQLite is the working set; the pgvector database on homellm
+(`192.168.1.33:5433/phillip_ai`) is for full history and heavy summarization.
+The sync reads the local DB directly and upserts into `activity_events` — the
+local DB already holds the text *and* the embeddings, so there is no intermediate
+export to collect.
 
-`synced = 1` on a row means *written to the outbox*, not *delivered* — nothing in
-this repo deletes or acknowledges outbox files, so they accumulate until something
-consumes them. Set `syncOutboxRetentionDays` to a positive number to prune files
-older than that many days; the default of `0` keeps everything.
+```bash
+make sync-setup      # one-time: venv + pure-Python pg8000 driver
+security add-generic-password -s activity-tracker-pgvector -a activity_tracker -w
+make sync-check      # connectivity, server version, remote row counts
+make sync-pgvector   # push pending rows
+```
+
+Useful flags: `make sync-pgvector ARGS="--dry-run"` (report only, no connection),
+`--limit 500`, `--reset-queue` (re-queue everything).
+
+How it works:
+
+- **Queue state is `events.pg_synced`**, deliberately separate from `synced`
+  (which the legacy file outbox sets). One shared flag would mean whichever
+  mechanism ran first marked rows done and silently starved the other.
+- **Idempotent.** `INSERT ... ON CONFLICT (id) DO NOTHING`, so a replayed batch is
+  harmless. Local rows are marked only *after* the remote commit, so a crash
+  mid-batch replays rather than drops.
+- **Duplicates are skipped** — their text already exists on the row that
+  introduced it, same as everywhere else in the system.
+- **Credentials are never in this repo.** Resolution order: `PGPASSWORD` →
+  macOS Keychain (service `activity-tracker-pgvector`) → `syncTarget.password` in
+  the config file.
+- The script creates the remote schema on first run (`activity_events`,
+  `activity_sessions`, `activity_audio_segments`). Creating the `vector`
+  extension needs superuser; if that fails it warns and assumes it is enabled.
+
+A full first run pushes ~82k rows (the accumulated history) and takes a few
+minutes; subsequent runs only send new events.
+
+### Retiring the legacy outbox
+
+The older design wrote a JSON file every 30 minutes to
+`~/.local/share/activity-tracker/sync-outbox/` for a companion script on homellm
+to collect. That script was never built, so the files accumulated (~980MB) with
+nothing reading them. It is now redundant:
+
+1. The direct sync above covers the same ground.
+2. To stop the daemon writing files, remove the `SyncEngine.performSync()` export
+   path (and repoint `get_sync_status` at the `pg_synced` queue, since `synced`
+   loses its meaning once nothing consumes it).
+3. Then delete `~/.local/share/activity-tracker/sync-outbox/`. The rows are still
+   in the local DB, so nothing is lost — but note the daemon marks them `synced`,
+   not `pg_synced`, so the direct sync will still pick them all up.
 
 Duplicate rows are not exported, so the outbox carries one copy of any given screen.
 

@@ -29,7 +29,7 @@ WHISPER_MODEL := $(MODEL_DIR)/ggml-small.bin
 SWIFT_BUILD := swift build -c release
 BINARY      := .build/release/ActivityTracker
 
-.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install harvest-chat harvest-install harvest-embed embedbackfill-install
+.PHONY: all install clean deps models run backfill migrate-screenpipe migrate-screenpipe-embed daemon-install daemon-uninstall embedserver-install harvest-chat harvest-install harvest-embed embedbackfill-install sync-setup sync-check sync-pgvector sync-dry-run
 
 all: $(BINARY) $(LLAMA_EMBED) $(LLAMA_SERVER) $(WHISPER_CLI) models
 	@echo ""
@@ -134,6 +134,33 @@ embedbackfill-install:
 	@echo "==> Embedding sweep installed (runs every 30 min)"
 	@echo "    Monitor: tail -f $(HOME)/.local/share/activity-tracker/logs/embedbackfill.log"
 	@echo "    Manual:  make backfill"
+
+# --- Direct pgvector sync ---
+# Reads the local SQLite DB and upserts into homellm pgvector. Replaces the
+# file-based outbox hand-off (the local DB already has the text and embeddings,
+# so a second copy on disk was an extra thing to collect).
+#
+# The password is never stored in this repo — it is read from the Keychain,
+# PGPASSWORD, or the config file, in that order.
+
+sync-setup:
+	python3 -m venv .venv
+	.venv/bin/python -m pip install --quiet --upgrade pip
+	.venv/bin/python -m pip install --quiet pg8000
+	@echo ""
+	@echo "==> Sync venv ready at .venv (pure-Python pg8000 driver, nothing to compile)"
+	@echo "    Store the Postgres password in the Keychain (this prompts):"
+	@echo "      security add-generic-password -s activity-tracker-pgvector -a activity_tracker -w"
+	@echo "    Then check connectivity:  make sync-check"
+
+sync-check:
+	.venv/bin/python scripts/sync_to_pgvector.py --check
+
+sync-dry-run:
+	.venv/bin/python scripts/sync_to_pgvector.py --dry-run
+
+sync-pgvector:
+	.venv/bin/python scripts/sync_to_pgvector.py $(ARGS)
 
 # --- Swift binary ---
 

@@ -886,6 +886,84 @@ Other details:
   window as 1,872 heartbeats before spotting it. This is the *same* mistake recorded
   on 2026-08-12 — wrap the column: `datetime(captured_at) > ...`.
 
+---
+
+## 2026-09-17 (later) — Outbox retired in favour of a direct DB→DB sync
+
+### Context
+
+Confirmed: **there is no homellm integration yet.** The outbox had therefore never
+had a consumer — 823 files, 978MB, and `synced=1` on 81,543 rows meant "written to a
+file nobody reads", not "delivered". The spec's D10/D13 always described a direct
+push ("TCP health check to pgvector port → push batch"); the file drop only existed
+because there was no Postgres client in Swift. But the *reader* doesn't have to be
+Swift.
+
+**Decision (user): read from one database and write to the other.**
+
+### What was built
+
+`scripts/sync_to_pgvector.py` — reads local SQLite, upserts into
+`activity_events` on homellm. Plain Python, so the Swift daemon stays free of a
+Postgres dependency, which is the constraint the spec was working around.
+
+- **Migration v3** adds `events.pg_synced` (plus the same column on
+  `audio_segments`) and an index.
+- **`sync-setup` / `sync-check` / `sync-pgvector` / `sync-dry-run`** Makefile targets.
+- Driver is **pg8000** — pure Python, so no compilation and no platform wheels. The
+  first attempt with `psycopg[binary]` failed against the pyenv Python 3.9 shim
+  (ancient pip, no matching wheel); pg8000 sidesteps that class of problem entirely.
+
+### Why a separate queue flag
+
+`pg_synced` is deliberately *not* `synced`. The daemon's file exporter sets
+`synced`, and if the new sync used the same column, whichever mechanism ran first
+would mark rows done and silently starve the other. With two flags the two
+mechanisms are fully independent and the migration is additive — no daemon
+behaviour change, nothing ripped out before the replacement is proven.
+
+### Credentials
+
+Never in the repo. Resolution order: `PGPASSWORD` → macOS Keychain (service
+`activity-tracker-pgvector`) → `syncTarget.password`. The missing-password error
+prints the exact `security add-generic-password` command, which prompts, so the
+value never enters shell history or a chat log.
+
+### Path chosen, and the one not taken
+
+I set aside the "laptop streams over SSH, homellm writes locally" option: SSH to
+`192.168.1.33` is denied for key auth, and it would have meant deploying and
+debugging a script on a machine I cannot inspect. The direct-push path runs entirely
+on a machine I can verify, at the cost of holding DB credentials here (worth
+revisiting if that matters later).
+
+### Verification without a live target
+
+I can't reach the remote DB, so I verified everything up to the wire:
+
+- `--dry-run`: **81,703 rows pending, 409 batches**, sample payloads with vectors
+  present (~10.6KB per vector as pgvector text input).
+- Missing-password path returns the actionable Keychain command, exit 2.
+- A fake-cursor harness captures the generated INSERT and asserts: placeholder count
+  equals param count (36 for 3 rows), the declared column list matches, params follow
+  column order with `machine_id` sourced from `sessions`, the vector literal is
+  well-formed at 1024 dims, `ON CONFLICT (id) DO NOTHING` is present, and NULL/short
+  blobs degrade to NULL instead of crashing.
+
+That harness caught two real things: `fetch_batch` initially selected
+`e.machine_id`, which doesn't exist (it lives on `sessions`) — and when I fixed the
+test's expectations, I had mis-mapped `app_bundle_id` vs `app_name` myself. Writing
+the assertion forced the mapping to be explicit rather than assumed.
+
+### Still outstanding
+
+1. **Add the Postgres password to the Keychain**, then `make sync-check` →
+   `make sync-pgvector`. First run pushes ~82k rows; later runs only new events.
+2. The legacy outbox still runs (harmless, independent, ~34MB/day). Retiring it
+   means removing the `performSync` export path, repointing `get_sync_status` at the
+   `pg_synced` queue, then deleting the files.
+3. Audio segments have a `pg_synced` column and a remote table, but aren't pushed yet.
+
 ### 7. Key Lessons
 
 - **A missing row and a missing embedding look identical to a query.** Both produce
