@@ -32,12 +32,22 @@ struct Config: Codable {
     /// window/tab title (measured 311 chars for LibreWolf vs 4,284 from OCR of
     /// the same capture). When both produce text, both are kept, AX first.
     var ocrEveryCapture: Bool = true
-    /// Concurrent Vision requests. Vision is CPU-bound, so this sets the drain
-    /// rate that bursts queue behind.
+    /// Concurrent Vision requests.
+    ///
+    /// **Not a throughput lever.** Measured 2026-09-18: 1-, 2-, 4- and 8-wide all
+    /// deliver ~0.43 OCR/sec against the same 34.8 MP image, so Vision serialises
+    /// internally. Raising it only increases CPU use — 4-wide burned ~2 cores for
+    /// no additional throughput. Leave it at 2.
     var ocrConcurrency: Int = 2
     /// How long an OCR attempt waits for a slot before giving up. The previous
     /// behaviour was to wait 0s and drop the work, losing content silently.
-    var ocrWaitSec: Double = 10
+    ///
+    /// This is the only real overspill lever. Throughput is ~0.45 OCR/sec
+    /// independent of concurrency and nearly independent of image size (measured
+    /// 2026-09-18: 2.3 MP = 1.64s, 34.8 MP = 2.38s per call), so a 10-capture
+    /// burst — the largest observed in one second — needs ~22s to drain. 30
+    /// covers that with margin; 10 lost part of every such burst.
+    var ocrWaitSec: Double = 30
 
     // MARK: Tier 1 per-window polling
     /// Apps whose windows get per-window change detection at a faster cadence.

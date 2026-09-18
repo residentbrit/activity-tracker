@@ -301,15 +301,20 @@ and when both produce text both are stored (AX first, since it carries structure
 | Key | Default | Effect |
 |---|---|---|
 | `ocrEveryCapture` | `true` | `false` restores AX-first: OCR only when AX returns nothing. |
-| `ocrConcurrency` | `2` | Concurrent Vision requests. Vision is CPU-bound, so this sets the drain rate that bursts queue behind. |
-| `ocrWaitSec` | `10` | How long an OCR attempt waits for a free slot before giving up. |
+| `ocrConcurrency` | `2` | Concurrent Vision requests. **Not a throughput lever** — 1-, 2-, 4- and 8-wide all give ~0.43 OCR/sec, so Vision serialises internally. Raising it only burns CPU. |
+| `ocrWaitSec` | `10` | How long an OCR attempt waits for a free slot. The only real overspill lever. |
 
 **Overspill.** Captures burst — 26% land in a second containing more than the gate can
 serve — while the excess backlog is single digits and drains in seconds. So an OCR attempt
 *waits* for a slot up to `ocrWaitSec` instead of giving up immediately, and the burst
 absorbs itself. The previous behaviour waited zero seconds and dropped the work, which
-stored the capture with empty text. Raising `ocrConcurrency` is the other lever, but only
-if there are idle cores to use.
+stored the capture with empty text.
+
+Note the ceiling: Vision delivers **~0.45 OCR/sec whether you run one request or eight**,
+and cost is dominated by fixed per-call overhead rather than image size (2.3 MP = 1.64s
+against 34.8 MP = 2.38s, but the full-size capture yields 38% more text). So throughput
+cannot be bought with concurrency, and downscaling trades a large text loss for a small
+speed-up. Time — `ocrWaitSec` — is the lever.
 
 `source_type` records how each capture was resolved:
 
