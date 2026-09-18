@@ -60,6 +60,21 @@ final class TextExtractor: Sendable {
         case unavailable
     }
 
+    /// What the captured image covers.
+    ///
+    /// This decides whether OCR text belonging to other windows is kept. A
+    /// full-desktop capture that keeps everything produces one blob whose row
+    /// metadata names a single app — measured 2026-09-18: a capture labelled
+    /// "Slack" also contained a VS Code file tree, an Oracle SQL*Plus banner and
+    /// a Gmail newsletter, six sources under one label.
+    enum CaptureScope {
+        /// The image is the whole desktop; text is grouped by window and only the
+        /// window this capture is about is kept.
+        case screen
+        /// The image is a single window, so all recognised text belongs to it.
+        case window
+    }
+
     enum SourceType: String, Codable {
         /// AX text only — OCR either was not run or added nothing.
         case accessibility
@@ -76,7 +91,9 @@ final class TextExtractor: Sendable {
 
     /// Extract text from the current screen context.
     /// `bundleID` optionally scopes which app to query via AX.
-    func extract(from image: CGImage, bundleID: String?) async -> ExtractionResult {
+    /// `scope` says what the image covers, which decides whether OCR text from
+    /// other windows is discarded — see `CaptureScope`.
+    func extract(from image: CGImage, bundleID: String?, scope: CaptureScope) async -> ExtractionResult {
         let axText = await extractViaAX(bundleID: bundleID) ?? ""
 
         // With ocrEveryCapture off this is the original AX-first behaviour: OCR
@@ -85,7 +102,7 @@ final class TextExtractor: Sendable {
             return ExtractionResult(text: axText, source: .accessibility)
         }
 
-        switch await extractViaOCR(image: image) {
+        switch await extractViaOCR(image: image, scope: scope, bundleID: bundleID) {
         case .text(let ocrText):
             guard !axText.isEmpty else {
                 return ExtractionResult(text: ocrText, source: .ocr)
@@ -214,11 +231,15 @@ final class TextExtractor: Sendable {
     /// bursts exceeding a 2-wide gate, but the excess backlog is single digits
     /// draining in seconds — so waiting absorbs it, and only sustained overload
     /// reaches the deadline.
-    private func extractViaOCR(image: CGImage) async -> OCRResult {
+    private func extractViaOCR(image: CGImage, scope: CaptureScope, bundleID: String?) async -> OCRResult {
         guard await acquireOCRSlot() else {
             log("[TextExtractor] OCR unavailable — no slot within \(config.ocrWaitSec)s\n")
             return .unavailable
         }
+
+        let imageSize = CGSize(width: image.width, height: image.height)
+        let capturedScope = scope
+        let capturedBundleID = bundleID
 
         // sem.wait() runs on the utility pool to avoid blocking Swift
         // concurrency threads or the contended user-initiated pool.
@@ -230,8 +251,12 @@ final class TextExtractor: Sendable {
                 let request = VNRecognizeTextRequest { request, error in
                     if error == nil,
                        let observations = request.results as? [VNRecognizedTextObservation] {
-                        let text = observations.compactMap { $0.topCandidates(1).first?.string }
-                            .joined(separator: "\n")
+                        let text = Self.keepWindowText(
+                            observations: observations,
+                            imageSize: imageSize,
+                            scope: capturedScope,
+                            bundleID: capturedBundleID
+                        )
                         ocrResult = text.isEmpty ? .noText : .text(text)
                     }
                     sem.signal()
@@ -254,6 +279,53 @@ final class TextExtractor: Sendable {
                 }
             }
         }
+    }
+
+    /// Keep only the recognised text belonging to the window this capture is
+    /// about, preserving the order Vision reported it in.
+    ///
+    /// Grouping is exact and free. The window list carries rectangles and a
+    /// front-to-back z-order, so "topmost window containing this box" resolves
+    /// ownership including occlusion — no image analysis needed, and it yields
+    /// the owning app's *name*, which edge detection could never produce.
+    ///
+    /// This replaces joining every observation with newlines in Vision's
+    /// detection order, which for a multi-column screen interleaves unrelated
+    /// columns and for a full-desktop capture mixes every visible app together.
+    private static func keepWindowText(
+        observations: [VNRecognizedTextObservation],
+        imageSize: CGSize,
+        scope: CaptureScope,
+        bundleID: String?
+    ) -> String {
+        // Vision boxes are normalised with a bottom-left origin; the window list
+        // uses top-left points, so flip y and scale out of backing pixels.
+        let desktop = ScreenWindows.desktopBoundsInPoints()
+        let scale = desktop.width > 0 ? imageSize.width / desktop.width : 1
+
+        var entries: [(text: String, centre: CGPoint)] = []
+        for observation in observations {
+            guard let text = observation.topCandidates(1).first?.string else { continue }
+            let box = observation.boundingBox
+            let x = (box.minX + box.width / 2) * imageSize.width / scale
+            let y = (1 - (box.minY + box.height / 2)) * imageSize.height / scale
+            entries.append((text, CGPoint(x: x + desktop.minX, y: y + desktop.minY)))
+        }
+
+        // A single-window capture *is* the window, so every observation belongs
+        // to it and the screen-space geometry above would be meaningless.
+        guard scope == .screen else { return entries.map(\.text).joined(separator: "\n") }
+
+        let windows = ScreenWindows.onScreen()
+        guard !windows.isEmpty else { return entries.map(\.text).joined(separator: "\n") }
+
+        // Prefer the frontmost window of the app this capture is about, so the
+        // text matches the row's app_name; otherwise the frontmost window.
+        let target = bundleID.flatMap { id in windows.first { $0.bundleID == id } } ?? windows[0]
+        return entries
+            .filter { target.bounds.contains($0.centre) }
+            .map(\.text)
+            .joined(separator: "\n")
     }
 
     /// Take an OCR slot, yielding between attempts instead of blocking a thread

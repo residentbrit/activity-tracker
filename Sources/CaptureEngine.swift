@@ -213,10 +213,16 @@ actor CaptureEngine {
         // 1. Capture the image. Heartbeat keeps the full screen; event-driven
         // triggers capture just the frontmost window (full-screen fallback).
         let image: CGImage?
+        let scope: TextExtractor.CaptureScope
         if trigger == "heartbeat" {
             image = await captureScreen()
+            scope = .screen
+        } else if let windowCapture = await captureFrontmostWindow() {
+            image = windowCapture.image
+            scope = windowCapture.scoped ? .window : .screen
         } else {
-            image = await captureFrontmostWindow()
+            image = nil
+            scope = .screen
         }
         guard let image else {
             // Separate the expected case from the alarming one: a display that
@@ -251,6 +257,7 @@ actor CaptureEngine {
                     bundleID: bundleID,
                     appName: appName,
                     windowTitle: windowTitle,
+                    scope: scope,
                     image: image
                 )
             }
@@ -260,10 +267,11 @@ actor CaptureEngine {
     private func processEvent(
         eventId: String, sessionId: String, capturedAt: String,
         trigger: String, bundleID: String?, appName: String?, windowTitle: String?,
+        scope: TextExtractor.CaptureScope,
         image: CGImage
     ) async {
-        // 1. Extract text — AX first, OCR fallback
-        let result = await extractor.extract(from: image, bundleID: bundleID)
+        // 1. Extract text — AX first, OCR with window grouping for the OCR half
+        let result = await extractor.extract(from: image, bundleID: bundleID, scope: scope)
         let text = result.text
         let sourceType = result.source.rawValue
 
@@ -388,7 +396,11 @@ actor CaptureEngine {
 
     /// Capture just the frontmost app's topmost window, falling back to a
     /// full-screen capture if no suitable window can be isolated.
-    private func captureFrontmostWindow() async -> CGImage? {
+    ///
+    /// Returns whether the image is genuinely window-scoped: the fallback reports
+    /// `false` so the caller asks OCR to group by window rather than treating the
+    /// whole desktop as one window.
+    private func captureFrontmostWindow() async -> (image: CGImage, scoped: Bool)? {
         guard CGPreflightScreenCaptureAccess() else {
             log("[CaptureEngine] ⚠️ Screen Recording permission not granted — cannot capture\n")
             return nil
@@ -410,10 +422,11 @@ actor CaptureEngine {
                     continuation.resume(returning: captured)
                 }
             }
-            if let image { return image }
+            if let image { return (image, true) }
         }
-        // Fallback: full screen
-        return await captureScreen()
+        // Fallback: full screen, and NOT window-scoped.
+        guard let image = await captureScreen() else { return nil }
+        return (image, false)
     }
 
     /// The CGWindowID of the frontmost app's topmost normal (layer 0) window,
@@ -585,6 +598,8 @@ actor CaptureEngine {
                     bundleID: bundleID,
                     appName: appName,
                     windowTitle: windowTitle,
+                    // Captured by window id, so the image is exactly one window.
+                    scope: .window,
                     image: image
                 )
             }
