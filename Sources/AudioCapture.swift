@@ -3,11 +3,19 @@ import AVFoundation
 
 /// Meetings-only audio capture (D5).
 ///
-/// Periodically checks meeting state via MeetingDetector. When a meeting
-/// starts: captures mic + system audio via AVAudioEngine, applies energy-based
-/// VAD to filter silence, accumulates speech segments. When meeting ends:
-/// transcribes via whisper.cpp (TODO), stores transcript + embedding,
-/// discards raw audio.
+/// Periodically checks meeting state via MeetingDetector. When a meeting starts:
+/// taps the mic via AVAudioEngine and accumulates **all** PCM for the duration.
+/// When it ends: transcribes the whole recording via whisper.cpp, stores the
+/// transcript + embedding, and discards the raw audio.
+///
+/// The energy VAD is deliberately NOT used to gate retention any more. Speech is
+/// amplitude-modulated internally — inter-word gaps and unvoiced consonants fall
+/// below any fixed threshold — so gating each ~85ms buffer independently kept only
+/// the loud fragments, concatenated into a mosaic. Measured 2026-09-18: a
+/// 21-minute Teams meeting retained 2.5 minutes of audio, and whisper then
+/// produced 903 chars/min on what it received, i.e. normal density. All of the
+/// loss was the gate. The VAD survives as a diagnostic only — see
+/// `vadPassedBuffers` and `peakRMS`.
 ///
 /// Audio capture is disabled if `audioMode` is `.off` in config.
 actor AudioCapture {
@@ -22,9 +30,18 @@ actor AudioCapture {
     private var meetingStartTime: Date?
     private var currentMeetingSession: Session?
     private var audioEngine: AVAudioEngine?
-    private var speechSegments: [Data] = []  // Raw PCM chunks that passed VAD
+    private var meetingAudio: [Data] = []    // Raw PCM for the whole meeting
+    private var retainedFrames = 0           // Frames retained, for the duration
+    private var totalBuffers = 0             // Buffers seen (diagnostic)
+    private var vadPassedBuffers = 0         // Buffers above the VAD threshold (diagnostic)
+    private var audioCapReached = false
     private var peakRMS: Double = 0          // Diagnostic: loudest level seen this meeting
     private var audioSampleRate: Double = 16000  // Mic native sample rate, set at engine start
+
+    /// Cap on retained meeting audio, purely a guard against a forgotten call
+    /// holding the mic open indefinitely. Raw 48 kHz mono Int16 is ~96 KB/s, so
+    /// two hours is ~690 MB — which is why this is a cap and not "keep forever".
+    private let maxMeetingAudioSeconds: Double = 2 * 60 * 60
 
     /// Window snapshot taken when the meeting started; we end the meeting only
     /// once this window disappears (not when focus is lost).
@@ -122,8 +139,7 @@ actor AudioCapture {
         meetingWindowRef = currentMeetingApp.flatMap { meetingDetector.frontmostMeetingWindow(for: $0) }
         meetingWindowMisses = 0
         meetingStartTime = Date()
-        speechSegments = []
-        peakRMS = 0
+        resetAudioBuffers()
 
         let session = Session(
             id: UUID().uuidString,
@@ -154,7 +170,12 @@ actor AudioCapture {
         audioEngine = nil
 
         let endedAt = ISO8601DateFormatter().string(from: Date())
-        log("[AudioCapture] meeting ended, \(speechSegments.count) speech segments, peak RMS \(String(format: "%.0f", peakRMS))\n")
+        let retainedSeconds = Double(retainedFrames) / max(audioSampleRate, 1)
+        let vadPercent = totalBuffers > 0
+            ? Double(vadPassedBuffers) / Double(totalBuffers) * 100
+            : 0
+        log("[AudioCapture] meeting ended, \(String(format: "%.1f", retainedSeconds / 60)) min audio retained "
+            + "(VAD passed \(String(format: "%.0f", vadPercent))% of buffers), peak RMS \(String(format: "%.0f", peakRMS))\n")
 
         // Snapshot meeting state into locals and clear actor state BEFORE any
         // await. Meetings flap (frontmost app changes every few seconds), so a
@@ -162,15 +183,16 @@ actor AudioCapture {
         // locals prevents the delayed resume from clobbering the new meeting.
         let session = currentMeetingSession
         let meetingApp = currentMeetingApp
-        let fullAudio = speechSegments.reduce(into: Data()) { $0.append($1) }
+        // Pre-size the concatenation: a full meeting is ~96 KB/s, so growing this
+        // by repeated reallocation would copy hundreds of MB more than needed.
+        let fullAudio = meetingAudio.reduce(into: Data(capacity: retainedFrames * 2)) { $0.append($1) }
 
         currentMeetingApp = nil
         meetingStartTime = nil
         currentMeetingSession = nil
         meetingWindowRef = nil
         meetingWindowMisses = 0
-        speechSegments = []
-        peakRMS = 0
+        resetAudioBuffers()
 
         if var session {
             session.endedAt = endedAt
@@ -241,14 +263,37 @@ actor AudioCapture {
         let samples = pcmData.withUnsafeBytes { ptr in
             Array(ptr.bindMemory(to: Int16.self).prefix(frameCount))
         }
-        if vadDetect(samples) {
-            speechSegments.append(pcmData)
+
+        // Retain every buffer. The transcript is only as complete as the audio
+        // handed to whisper, and dropping the quiet parts of speech is exactly
+        // what made earlier transcripts cover ~12% of a meeting.
+        totalBuffers += 1
+        if Double(retainedFrames) / max(audioSampleRate, 1) >= maxMeetingAudioSeconds {
+            if !audioCapReached {
+                audioCapReached = true
+                log("[AudioCapture] ⚠️ \(Int(maxMeetingAudioSeconds / 60))-minute audio cap reached — dropping further audio\n")
+            }
+        } else {
+            meetingAudio.append(pcmData)
+            retainedFrames += frameCount
         }
-        // Track the loudest chunk for diagnostics — lets us distinguish
-        // "mic delivered silence" from "VAD threshold too high".
+
+        // VAD retained as a diagnostic only: the pass rate says whether the mic
+        // is delivering level at all, and peakRMS separates "mic silent" from
+        // "threshold too high".
+        if vadDetect(samples) { vadPassedBuffers += 1 }
         if let rms = rmsLevel(samples), rms > peakRMS {
             peakRMS = rms
         }
+    }
+
+    private func resetAudioBuffers() {
+        meetingAudio = []
+        retainedFrames = 0
+        totalBuffers = 0
+        vadPassedBuffers = 0
+        audioCapReached = false
+        peakRMS = 0
     }
 
     /// Simple energy-based VAD. Returns true if RMS exceeds threshold.
