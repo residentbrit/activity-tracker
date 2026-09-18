@@ -238,6 +238,125 @@ enum SemanticSearch {
         if kept.count > limit { kept.removeFirst() }
     }
 
+    // MARK: - Meeting transcripts
+
+    /// Cosine floor for meeting transcripts.
+    ///
+    /// Calibrated separately from `minSimilarity`, and it has to be: transcripts
+    /// are conversational, so their mean-pooled embeddings are more diffuse and
+    /// absolute scores sit well below screen text. Measured against the 19 stored
+    /// transcripts on 2026-09-18: genuinely matching queries scored 0.576–0.621,
+    /// while unrelated ones topped out at 0.472 and a plausible-but-absent topic
+    /// reached 0.510. **The events floor of 0.62 would have returned nothing for
+    /// three of the four answerable queries.**
+    ///
+    /// Chunking was tried as a way to improve coverage and localisation, and
+    /// measurably hurt. At ~150-word chunks the two paraphrase queries moved to
+    /// the wrong meeting and the no-answer floor *rose* to 0.509; averaging the
+    /// chunk vectors into one per-meeting vector was worse again (no-answer floor
+    /// 0.512, correct meeting lost on two of four). A short chunk of
+    /// conversational filler has too little topical anchoring, and averaging
+    /// dilutes it. Ranking therefore stays on the whole transcript's embedding.
+    static let minTranscriptSimilarity: Float = 0.55
+
+    struct TranscriptResult {
+        let id: String
+        let sessionID: String
+        let startedAt: String
+        let endedAt: String?
+        let meetingApp: String?
+        let transcript: String
+        let similarity: Float
+    }
+
+    /// Brute-force cosine ranking over stored meeting transcripts.
+    ///
+    /// Simpler than `search` in one respect — the corpus is tens of rows, so every
+    /// hit above the threshold is collected rather than a bounded top-k — but the
+    /// scoring itself is identical: normalised query, `vDSP_dotpr` against a
+    /// re-used scratch buffer, and the same unit-norm assumption (verified:
+    /// norms are 1.0000 across all 19 rows).
+    static func searchTranscripts(
+        handle: OpaquePointer?,
+        query: [Float],
+        limit: Int
+    ) throws -> [TranscriptResult] {
+        guard let handle, limit > 0 else { return [] }
+
+        let sql = """
+            SELECT id, embedding FROM audio_segments
+            WHERE embedding IS NOT NULL AND LENGTH(TRIM(transcript)) > 0
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.executeFailed(String(cString: sqlite3_errmsg(handle)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var queryVector = query
+        normalize(&queryVector)
+
+        var scratch = [Float](repeating: 0, count: dimensions)
+        var hits: [(id: String, similarity: Float)] = []
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let idPtr = sqlite3_column_text(stmt, 0),
+                  let blob = sqlite3_column_blob(stmt, 1),
+                  Int(sqlite3_column_bytes(stmt, 1)) == byteCount else { continue }
+
+            scratch.withUnsafeMutableBytes { destination in
+                memcpy(destination.baseAddress, blob, byteCount)
+            }
+
+            var similarity: Float = 0
+            vDSP_dotpr(queryVector, 1, scratch, 1, &similarity, vDSP_Length(dimensions))
+            guard similarity >= minTranscriptSimilarity else { continue }
+            hits.append((String(cString: idPtr), similarity))
+        }
+
+        hits.sort { $0.similarity > $1.similarity }
+
+        var results: [TranscriptResult] = []
+        for hit in hits where results.count < limit {
+            if let result = try fetchTranscript(handle: handle, id: hit.id, similarity: hit.similarity) {
+                results.append(result)
+            }
+        }
+        return results
+    }
+
+    private static func fetchTranscript(
+        handle: OpaquePointer, id: String, similarity: Float
+    ) throws -> TranscriptResult? {
+        let sql = """
+            SELECT session_id, started_at, ended_at, meeting_app, transcript
+            FROM audio_segments WHERE id = ?
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.executeFailed(String(cString: sqlite3_errmsg(handle)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, id, -1, sqliteTransient)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        func text(_ index: Int32) -> String? {
+            guard let ptr = sqlite3_column_text(stmt, index) else { return nil }
+            return String(cString: ptr)
+        }
+
+        return TranscriptResult(
+            id: id,
+            sessionID: text(0) ?? "",
+            startedAt: text(1) ?? "",
+            endedAt: text(2),
+            meetingApp: text(3),
+            transcript: text(4) ?? "",
+            similarity: similarity
+        )
+    }
+
     /// Cosine similarity for a specific set of events.
     ///
     /// Literal matches that don't reach the semantic top-k still need a real

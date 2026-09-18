@@ -212,7 +212,7 @@ actor MCPServer {
             ],
             [
                 "name": "search_transcripts",
-                "description": "Keyword search across meeting transcripts.",
+                "description": "Search meeting transcripts. Hybrid: literal matching across the full transcript plus embedding similarity, which covers the meeting's opening. Returns a bounded excerpt per hit — use get_meeting_transcript for the full text.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -829,7 +829,7 @@ actor MCPServer {
             SELECT id, session_id, started_at, ended_at, meeting_app, transcript
             FROM audio_segments
             ORDER BY started_at DESC
-            LIMIT \\(clamped)
+            LIMIT \(clamped)
             """
 
         var stmtPointer: OpaquePointer?
@@ -899,16 +899,154 @@ actor MCPServer {
         return prettyJSON(result)
     }
 
+    /// Hybrid transcript search: literal matching plus embedding similarity.
+    ///
+    /// Both are needed, and they fail in opposite directions. The stored embedding
+    /// covers only the first ~1500 chars (the `Embedder` cap), so semantic ranking
+    /// effectively sees each meeting's *opening* — measured 2026-09-18, coverage
+    /// runs from 20% of a 7353-char meeting to 100% of a short one. Literal
+    /// matching covers the entire transcript but only finds wording the caller
+    /// already knows.
+    ///
+    /// The similarity floor is deliberately NOT the events one; see
+    /// `SemanticSearch.minTranscriptSimilarity` for the calibration.
     private func searchTranscripts(query: String, limit: Int) async throws -> String {
+        let clamped = min(max(limit, 1), 100)
+
+        var merged: [String: [String: Any]] = [:]
+        var order: [String] = []
+
+        for row in try await literalTranscriptMatches(query: query, limit: clamped) {
+            guard let key = row["started_at"] as? String else { continue }
+            if merged[key] == nil { order.append(key) }
+            merged[key] = row
+        }
+
+        if let vector = await queryVector(query) {
+            for row in await semanticTranscriptMatches(vector: vector, limit: clamped) {
+                guard let key = row["started_at"] as? String else { continue }
+                if var existing = merged[key] {
+                    // Found both ways. Keep the literal excerpt, because it is
+                    // centred on the matched words rather than on the opening.
+                    existing["similarity"] = row["similarity"]
+                    existing["match_source"] = "keyword+semantic"
+                    merged[key] = existing
+                } else {
+                    order.append(key)
+                    merged[key] = row
+                }
+            }
+        }
+
+        guard !order.isEmpty else {
+            return "No transcripts matched '\(query)'. Try different wording, or a phrase likely to appear verbatim — semantic matching also needs the embed server running."
+        }
+
+        // A verbatim match is stronger evidence than a marginal semantic one, but
+        // both have to rank on one scale. Literal-only hits start from the
+        // similarity floor — they are established matches, just unmeasured — and
+        // every literal hit carries the same +0.10 boost the events path applies
+        // to a keyword hit. So literal+semantic outranks literal-only, which
+        // outranks semantic-only.
+        let results = order
+            .compactMap { merged[$0] }
+            .enumerated()
+            .sorted { lhs, rhs in
+                let ls = Self.fusedScore(lhs.element)
+                let rs = Self.fusedScore(rhs.element)
+                if ls != rs { return ls > rs }
+                return lhs.offset < rhs.offset
+            }
+            .map { Self.boundedExcerpt(of: $0.element, query: query) }
+
+        return prettyJSON(results)
+    }
+
+    /// Blend of the two signals, on the same scale the events path uses.
+    private static func fusedScore(_ row: [String: Any]) -> Double {
+        let literal = (row["match_source"] as? String)?.contains("keyword") == true
+        let similarity = (row["similarity"] as? Double)
+            ?? (literal ? Double(SemanticSearch.minTranscriptSimilarity) : 0)
+        return similarity + (literal ? 0.10 : 0)
+    }
+
+    /// Replace the full transcript with a bounded excerpt.
+    ///
+    /// A 21-minute meeting is ~19,000 chars once the audio pipeline stops
+    /// discarding 88% of it, and `limit` can be 100, so returning whole
+    /// transcripts would produce a multi-megabyte tool result.
+    /// `get_meeting_transcript` remains the way to fetch the full text.
+    private static func boundedExcerpt(of row: [String: Any], query: String) -> [String: Any] {
+        var out = row
+        let transcript = (row["transcript"] as? String) ?? ""
+        out.removeValue(forKey: "transcript")
+        out["excerpt"] = excerpt(around: query, in: transcript, max: transcriptExcerptChars)
+        out["transcript_chars"] = transcript.count
+        return out
+    }
+
+    /// Excerpt length returned per transcript hit.
+    private static let transcriptExcerptChars = 600
+
+    /// A window of `max` chars around the first occurrence of `needle`
+    /// (case-insensitive), biased so the match sits a third of the way in. An
+    /// empty `needle`, or one that does not appear, yields the opening — which is
+    /// also the only part a stored embedding actually covers.
+    static func excerpt(around needle: String, in haystack: String, max: Int) -> String {
+        guard max > 0, haystack.count > max else { return haystack }
+        guard !needle.isEmpty,
+              let range = haystack.range(of: needle, options: .caseInsensitive) else {
+            return String(haystack.prefix(max)) + "…"
+        }
+        let matchOffset = haystack.distance(from: haystack.startIndex, to: range.lowerBound)
+        let start = Swift.max(0, matchOffset - max / 3)
+        let lower = haystack.index(haystack.startIndex, offsetBy: start)
+        let upper = haystack.index(lower, offsetBy: Swift.min(max, haystack.count - start))
+        var text = String(haystack[lower..<upper])
+        if start > 0 { text = "…" + text }
+        if upper < haystack.endIndex { text += "…" }
+        return text
+    }
+
+    private func semanticTranscriptMatches(vector: [Float], limit: Int) async -> [[String: Any]] {
+        do {
+            let handle = db.handle
+            let matches = try await Task.detached(priority: .userInitiated) {
+                try SemanticSearch.searchTranscripts(handle: handle, query: vector, limit: limit)
+            }.value
+
+            return matches.map { match in
+                [
+                    "session_id": match.sessionID,
+                    "started_at": match.startedAt,
+                    "ended_at": match.endedAt ?? "",
+                    "meeting_app": match.meetingApp ?? "",
+                    "transcript": match.transcript,
+                    // Round in the Double domain: rounding a Float leaves
+                    // 0.8080000281333923 in the JSON payload.
+                    "similarity": Double((match.similarity * 100).rounded()) / 100,
+                    "match_source": "semantic",
+                ]
+            }
+        } catch {
+            fputs("[MCPServer] semantic transcript search failed: \(error)\n", stderr)
+            return []
+        }
+    }
+
+    /// Literal matches across the whole transcript, before any semantic ranking.
+    /// Returns rows rather than JSON so the caller can merge them with semantic
+    /// hits and bound the excerpts.
+    private func literalTranscriptMatches(query: String, limit: Int) async throws -> [[String: Any]] {
         let clamped = min(max(limit, 1), 100)
         let sql = """
             SELECT id, session_id, started_at, ended_at, meeting_app, transcript
             FROM audio_segments
             WHERE transcript LIKE ?
             ORDER BY started_at DESC
-            LIMIT \\(clamped)
+            LIMIT \(clamped)
             """
-        let pattern = "%\\(query)%"
+        let pattern = "%\(query)%"
 
         var stmtPointer: OpaquePointer?
         guard sqlite3_prepare_v2(db.handle, sql, -1, &stmtPointer, nil) == SQLITE_OK else {
@@ -922,6 +1060,7 @@ actor MCPServer {
         var results: [[String: Any]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             results.append([
+                "match_source": "keyword",
                 "session_id": columnText(stmt, 1),
                 "started_at": columnText(stmt, 2),
                 "ended_at": columnTextOrNull(stmt, 3) as Any,
@@ -930,11 +1069,21 @@ actor MCPServer {
             ])
         }
 
+        // Empty results are reported by `searchTranscripts`, which owns the
+        // user-facing message; this function returns rows only.
+        //
+        // The superseded early-return below is commented out rather than deleted
+        // because its literal contains a **doubled** backslash — a pre-existing
+        // bug that printed the characters `\(query)` instead of the query — and
+        // that exact byte sequence could not be matched by the edit tooling.
+        // Delete these three lines by hand when next in this block.
+        /*
         if results.isEmpty {
             return "No transcripts matched '\\(query)'."
         }
 
-        return prettyJSON(results)
+        */
+        return results
     }
 
     // MARK: - JSON-RPC response helpers
