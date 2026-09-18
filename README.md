@@ -52,7 +52,7 @@ You'll be prompted for:
 │                  Capture Agent (Swift)                 │
 │                                                        │
 │  ScreenCaptureKit ──► AX Text Extraction ──► Embedding │
-│  InputMonitor     ──► OCR Fallback         ──► SQLite  │
+│  InputMonitor     ──► OCR (always)         ──► SQLite  │
 │  AVFoundation     ──► VAD → whisper.cpp   ──► SQLite  │
 │                                                        │
 │  Full-screen triggers: app-switch, window-title-change,│
@@ -229,6 +229,9 @@ home directory):
   "meetingWindowTitlePatterns" : [
     "huddle"
   ],
+  "ocrConcurrency" : 2,
+  "ocrEveryCapture" : true,
+  "ocrWaitSec" : 10,
   "screenshotRetentionHours" : 24,
   "syncIntervalMin" : 30,
   "syncOutboxEnabled" : false,
@@ -269,7 +272,7 @@ Changes take effect on SIGHUP — no restart needed.
   ```bash
   grep -A2 'loading config' ~/.local/share/activity-tracker/logs/collector-error.log
   #   config loaded
-  #     heartbeat=15s tier1=6 apps meetings=4 ids audio=meetings_only outbox_retention=0d
+  #     heartbeat=15s tier1=6 apps meetings=4 ids audio=meetings_only ocr=every/2wide/10s outbox_retention=0d
   ```
 
 ### The two settings that fail quietly: bundle ids
@@ -287,6 +290,44 @@ Check an installed app's real id with:
 ```bash
 osascript -e 'id of app "Microsoft Teams"'
 ```
+
+### OCR: why it runs on every capture
+
+AX alone under-reports what is on screen. In a browser the accessibility tree yields only
+the window/tab title — measured **311 chars for LibreWolf against 4,284 from OCR of the
+same capture**. So OCR is not merely a fallback: with `ocrEveryCapture: true` both run,
+and when both produce text both are stored (AX first, since it carries structure).
+
+| Key | Default | Effect |
+|---|---|---|
+| `ocrEveryCapture` | `true` | `false` restores AX-first: OCR only when AX returns nothing. |
+| `ocrConcurrency` | `2` | Concurrent Vision requests. Vision is CPU-bound, so this sets the drain rate that bursts queue behind. |
+| `ocrWaitSec` | `10` | How long an OCR attempt waits for a free slot before giving up. |
+
+**Overspill.** Captures burst — 26% land in a second containing more than the gate can
+serve — while the excess backlog is single digits and drains in seconds. So an OCR attempt
+*waits* for a slot up to `ocrWaitSec` instead of giving up immediately, and the burst
+absorbs itself. The previous behaviour waited zero seconds and dropped the work, which
+stored the capture with empty text. Raising `ocrConcurrency` is the other lever, but only
+if there are idle cores to use.
+
+`source_type` records how each capture was resolved:
+
+| `source_type` | Meaning |
+|---|---|
+| `accessibility` | AX text; OCR added nothing (or was not run). |
+| `ocr` | OCR text only — AX returned nothing. |
+| `accessibility+ocr` | Both produced text; both stored. |
+| `none` | Both ran and neither found text. A genuinely blank capture. |
+| `ocr_unavailable` | AX was empty *and* OCR never ran. **The only value meaning content was lost** — should stay at zero. |
+
+```sql
+SELECT source_type, count(*) FROM events
+WHERE datetime(captured_at) > datetime('now','-1 day') GROUP BY 1;
+```
+
+A rising `ocr_unavailable` means OCR is falling behind: raise `ocrConcurrency` first, then
+`ocrWaitSec`.
 
 ### Settings that delete data
 

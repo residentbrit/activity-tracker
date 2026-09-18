@@ -25,6 +25,20 @@ struct Config: Codable {
     var typingPauseSec: Int = 3
     var idleTimeoutMin: Int = 5
 
+    // MARK: OCR
+    /// Run Vision OCR on every capture, not only when AX returns nothing.
+    ///
+    /// AX alone under-reports rendered content: in browsers it yields just the
+    /// window/tab title (measured 311 chars for LibreWolf vs 4,284 from OCR of
+    /// the same capture). When both produce text, both are kept, AX first.
+    var ocrEveryCapture: Bool = true
+    /// Concurrent Vision requests. Vision is CPU-bound, so this sets the drain
+    /// rate that bursts queue behind.
+    var ocrConcurrency: Int = 2
+    /// How long an OCR attempt waits for a slot before giving up. The previous
+    /// behaviour was to wait 0s and drop the work, losing content silently.
+    var ocrWaitSec: Double = 10
+
     // MARK: Tier 1 per-window polling
     /// Apps whose windows get per-window change detection at a faster cadence.
     /// AX-capable apps use text-hash diffs; AX-opaque apps use pixel-diff thumbnails.

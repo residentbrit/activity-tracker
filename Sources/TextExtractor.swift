@@ -2,9 +2,14 @@ import Foundation
 import Vision
 import Cocoa
 
-/// AX-first, OCR-fallback text extraction (D3).
-/// Accessibility tree is fast, free, resolution-independent.
-/// Vision OCR only fires when AX comes back empty.
+/// AX-first text extraction with Vision OCR as either fallback or companion
+/// (D3, extended 2026-09-17).
+///
+/// The accessibility tree is fast, free and resolution-independent, but in
+/// browsers and Electron apps it returns only the window/tab title — measured
+/// 311 chars for LibreWolf against 4,284 from OCR of the same capture. So OCR
+/// is not merely a fallback: with `ocrEveryCapture` both run and both are kept.
+///
 /// Not an actor — extractions run concurrently on GCD threads, one per capture.
 final class TextExtractor: Sendable {
 
@@ -26,34 +31,85 @@ final class TextExtractor: Sendable {
         label: "activity-tracker.ocr", qos: .userInitiated, attributes: .concurrent)
 
     /// Bounds concurrent Vision requests (they can each block a thread while
-    /// the Vision framework does its own internal scheduling).
-    private static let ocrGate = DispatchSemaphore(value: 2)
+    /// the Vision framework does its own internal scheduling). Per-instance so
+    /// the width is tunable via `ocrConcurrency` without an edit.
+    private let ocrGate: DispatchSemaphore
+
+    private let config: Config
+
+    init(config: Config) {
+        self.config = config
+        self.ocrGate = DispatchSemaphore(value: max(1, config.ocrConcurrency))
+    }
 
     struct ExtractionResult {
         let text: String
         let source: SourceType
     }
 
+    /// How an OCR attempt ended.
+    ///
+    /// `noText` and `unavailable` must never be conflated: the old code returned
+    /// nil for both, which is how captures that lost content ended up stored
+    /// identically to captures that genuinely had none.
+    enum OCRResult {
+        case text(String)
+        /// Vision ran to completion and found no text.
+        case noText
+        /// Vision never got a slot, or exceeded its timeout.
+        case unavailable
+    }
+
     enum SourceType: String, Codable {
+        /// AX text only — OCR either was not run or added nothing.
         case accessibility
+        /// OCR text only (AX returned nothing).
         case ocr
+        /// Both produced text; both are stored, AX first.
+        case accessibilityAndOCR = "accessibility+ocr"
+        /// Both ran and neither found text. A genuinely blank capture.
+        case none
+        /// AX was empty and OCR never ran — the only case where a capture is
+        /// missing content it should have had. Should be ~0 in a healthy run.
+        case ocrUnavailable = "ocr_unavailable"
     }
 
     /// Extract text from the current screen context.
     /// `bundleID` optionally scopes which app to query via AX.
     func extract(from image: CGImage, bundleID: String?) async -> ExtractionResult {
-        // 1. Try accessibility tree first
-        if let axText = await extractViaAX(bundleID: bundleID), !axText.isEmpty {
+        let axText = await extractViaAX(bundleID: bundleID) ?? ""
+
+        // With ocrEveryCapture off this is the original AX-first behaviour: OCR
+        // only fires when AX came back empty.
+        if !config.ocrEveryCapture, !axText.isEmpty {
             return ExtractionResult(text: axText, source: .accessibility)
         }
 
-        // 2. Fall back to OCR
-        if let ocrText = await extractViaOCR(image: image) {
-            return ExtractionResult(text: ocrText, source: .ocr)
-        }
+        switch await extractViaOCR(image: image) {
+        case .text(let ocrText):
+            guard !axText.isEmpty else {
+                return ExtractionResult(text: ocrText, source: .ocr)
+            }
+            // Keep both. AX carries structure (app, window and tab titles), OCR
+            // carries rendered content; in a browser AX is ~311 chars of tab
+            // title against ~4,300 of page text, so discarding either loses signal.
+            return ExtractionResult(
+                text: axText + "\n" + ocrText,
+                source: .accessibilityAndOCR
+            )
 
-        // Nothing found
-        return ExtractionResult(text: "", source: .accessibility)
+        case .noText:
+            return axText.isEmpty
+                ? ExtractionResult(text: "", source: .none)
+                : ExtractionResult(text: axText, source: .accessibility)
+
+        case .unavailable:
+            // AX covers it, so nothing is lost; the loss is only real when AX
+            // was empty too, which is the case worth counting.
+            return axText.isEmpty
+                ? ExtractionResult(text: "", source: .ocrUnavailable)
+                : ExtractionResult(text: axText, source: .accessibility)
+        }
     }
 
     // MARK: - Accessibility (AXUIElement)
@@ -149,24 +205,34 @@ final class TextExtractor: Sendable {
 
     // MARK: - Vision OCR
 
-    private func extractViaOCR(image: CGImage) async -> String? {
-        // Bound concurrent Vision requests to avoid piling up blocked threads.
-        guard Self.ocrGate.wait(timeout: .now()) == .success else {
-            return nil
+    /// OCR `image`, waiting up to `ocrWaitSec` for a slot rather than giving up
+    /// immediately.
+    ///
+    /// The original code acquired the gate with `timeout: .now()` and returned
+    /// nil on failure, so any burst silently discarded OCR work and stored the
+    /// capture with empty text. Measured 2026-09-17: 26% of captures arrive in
+    /// bursts exceeding a 2-wide gate, but the excess backlog is single digits
+    /// draining in seconds — so waiting absorbs it, and only sustained overload
+    /// reaches the deadline.
+    private func extractViaOCR(image: CGImage) async -> OCRResult {
+        guard await acquireOCRSlot() else {
+            log("[TextExtractor] OCR unavailable — no slot within \(config.ocrWaitSec)s\n")
+            return .unavailable
         }
 
         // sem.wait() runs on the utility pool to avoid blocking Swift
         // concurrency threads or the contended user-initiated pool.
         return await withCheckedContinuation { continuation in
             let sem = DispatchSemaphore(value: 0)
-            var ocrResult: String? = nil
+            var ocrResult: OCRResult = .noText
             Self.ocrQueue.async {
-                defer { Self.ocrGate.signal() }
+                defer { self.ocrGate.signal() }
                 let request = VNRecognizeTextRequest { request, error in
                     if error == nil,
                        let observations = request.results as? [VNRecognizedTextObservation] {
-                        ocrResult = observations.compactMap { $0.topCandidates(1).first?.string }
+                        let text = observations.compactMap { $0.topCandidates(1).first?.string }
                             .joined(separator: "\n")
+                        ocrResult = text.isEmpty ? .noText : .text(text)
                     }
                     sem.signal()
                 }
@@ -177,10 +243,36 @@ final class TextExtractor: Sendable {
             }
             DispatchQueue.global(qos: .utility).async {
                 if sem.wait(timeout: .now() + 8) == .timedOut {
+                    // The waiter gives up, but Vision keeps running and holds
+                    // its gate slot until it returns — so a genuinely hung
+                    // request permanently costs throughput. Logged loudly
+                    // because two of these silently halve the drain rate.
                     log("[TextExtractor] OCR timed out\n")
+                    continuation.resume(returning: .unavailable)
+                } else {
+                    continuation.resume(returning: ocrResult)
                 }
-                continuation.resume(returning: ocrResult)
             }
         }
+    }
+
+    /// Take an OCR slot, yielding between attempts instead of blocking a thread
+    /// for the whole wait.
+    private func acquireOCRSlot() async -> Bool {
+        if tryAcquireOCRSlot() { return true }
+        let deadline = Date().addingTimeInterval(max(0, config.ocrWaitSec))
+        while Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+            if tryAcquireOCRSlot() { return true }
+        }
+        return false
+    }
+
+    /// Non-blocking try-acquire. Kept in a synchronous function because
+    /// `DispatchSemaphore.wait` is flagged in async contexts even with a zero
+    /// timeout, where it provably cannot block — and that warning is an error
+    /// under the Swift 6 language mode.
+    private func tryAcquireOCRSlot() -> Bool {
+        ocrGate.wait(timeout: .now()) == .success
     }
 }

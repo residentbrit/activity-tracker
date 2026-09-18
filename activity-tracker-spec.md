@@ -64,7 +64,8 @@ was decided, what shipped.
   same `mxbai-embed-large` embedding pipeline already built for other RAG
   work.
 - Rough schema idea (not finalized — see open questions):
-  `events(ts, device, app, window_title, source_type[accessibility|ocr|audio],
+  `events(ts, device, app, window_title,
+  source_type[accessibility|ocr|accessibility+ocr|none|ocr_unavailable|audio_transcript],
   text, embedding, tags)`
 
 ### 5. What we're intentionally simplifying vs. screenpipe
@@ -197,7 +198,7 @@ CREATE TABLE events (
     app_name TEXT,                    -- e.g. "Visual Studio Code"
     window_title TEXT,                -- e.g. "spec.md — screenrecorder"
     active_file_path TEXT,
-    source_type TEXT NOT NULL,        -- accessibility|ocr|audio_transcript
+    source_type TEXT NOT NULL,        -- accessibility | ocr | accessibility+ocr | none | ocr_unavailable | audio_transcript
     text_content TEXT NOT NULL,       -- extracted text or transcript
     embedding BLOB,                   -- 1024-dim float32 from llama.cpp mxbai-embed-large
     dedup_key TEXT,                   -- hash(text_content) for near-duplicate detection

@@ -28,6 +28,8 @@ struct ActivityTracker {
             + "tier1=\(config.tier1BundleIDs.count) apps "
             + "meetings=\(config.meetingBundleIDs.count) ids "
             + "audio=\(config.audioMode.rawValue) "
+            + "ocr=\(config.ocrEveryCapture ? "every" : "fallback")/"
+            + "\(config.ocrConcurrency)wide/\(Int(config.ocrWaitSec))s "
             + "outbox_retention=\(config.syncOutboxRetentionDays)d\n")
 
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)

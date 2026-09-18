@@ -49,7 +49,7 @@ actor CaptureEngine {
         self.config = config
         self.db = database
         self.eventStore = EventStore(database: database)
-        self.extractor = TextExtractor()
+        self.extractor = TextExtractor(config: config)
         self.embedder = Embedder(config: config)
     }
 
