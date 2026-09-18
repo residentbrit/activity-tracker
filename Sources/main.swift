@@ -3,6 +3,24 @@ import Darwin
 
 private var retainedSignalSources: [DispatchSourceSignal] = []
 
+/// Log the effective values that are easy to get wrong, so a config that silently
+/// failed to load — or was overridden by defaults — is obvious from the log rather
+/// than hours later.
+///
+/// Called on startup *and* on SIGHUP reload. A reload that quietly applies the
+/// wrong values is exactly the failure this guards against, and the reload path
+/// previously logged nothing about them — so the documented check didn't work for
+/// the way config changes are actually applied.
+private func logEffectiveConfig(_ config: Config) {
+    log("  heartbeat=\(config.heartbeatIntervalSec)s "
+        + "tier1=\(config.tier1BundleIDs.count) apps "
+        + "meetings=\(config.meetingBundleIDs.count) ids "
+        + "audio=\(config.audioMode.rawValue) "
+        + "ocr=\(config.ocrEveryCapture ? "every" : "fallback")/"
+        + "\(config.ocrConcurrency)wide/\(Int(config.ocrWaitSec))s "
+        + "outbox_retention=\(config.syncOutboxRetentionDays)d\n")
+}
+
 /// Entry point. Sets up signal handlers, loads config, starts the capture daemon.
 /// Runs as a background agent — no GUI, no dock icon.
 @main
@@ -21,16 +39,7 @@ struct ActivityTracker {
         }
         log("config loaded")
 
-        // Log the effective values that are easy to get wrong, so a config that
-        // silently failed to load (or was overridden by defaults) is obvious from
-        // the startup log rather than hours later.
-        log("  heartbeat=\(config.heartbeatIntervalSec)s "
-            + "tier1=\(config.tier1BundleIDs.count) apps "
-            + "meetings=\(config.meetingBundleIDs.count) ids "
-            + "audio=\(config.audioMode.rawValue) "
-            + "ocr=\(config.ocrEveryCapture ? "every" : "fallback")/"
-            + "\(config.ocrConcurrency)wide/\(Int(config.ocrWaitSec))s "
-            + "outbox_retention=\(config.syncOutboxRetentionDays)d\n")
+        logEffectiveConfig(config)
 
         // 2. Initialize storage (creates SQLite DB + runs migrations if needed)
         //    MCP-only mode opens read-only — it must never write or create the DB.
@@ -83,6 +92,7 @@ struct ActivityTracker {
                     await syncEngine.applyConfig(newConfig)
                     await audioCapture.applyConfig(newConfig)
                     log("reloaded config via SIGHUP")
+                    logEffectiveConfig(newConfig)
                 } catch {
                     log("config reload failed: \(error)")
                 }
