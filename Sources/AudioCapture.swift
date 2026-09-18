@@ -35,13 +35,24 @@ actor AudioCapture {
     private var totalBuffers = 0             // Buffers seen (diagnostic)
     private var vadPassedBuffers = 0         // Buffers above the VAD threshold (diagnostic)
     private var audioCapReached = false
-    private var peakRMS: Double = 0          // Diagnostic: loudest level seen this meeting
+    private var peakRMS: Double = 0          // Diagnostic: loudest mic level this meeting
     private var audioSampleRate: Double = 16000  // Mic native sample rate, set at engine start
 
+    /// What the machine is *playing* — the far end of the call.
+    ///
+    /// The mic alone records the room, so a meeting heard through headphones is
+    /// invisible to it: measured 2026-09-18, two Teams meetings yielded ~10-12%
+    /// of their speech because only the local voice reached the mic.
+    private var systemAudio: [Data] = []
+    private var systemFrames = 0
+    private var systemPeakRMS: Double = 0
+    private var systemCapReached = false
+    private var systemCapture: SystemAudioCapture?
+
     /// Cap on retained meeting audio, purely a guard against a forgotten call
-    /// holding the mic open indefinitely. Raw 48 kHz mono Int16 is ~96 KB/s, so
-    /// two hours is ~690 MB — which is why this is a cap and not "keep forever".
-    private let maxMeetingAudioSeconds: Double = 2 * 60 * 60
+    /// holding the mic open indefinitely. Each source is 48 kHz mono Int16 at
+    /// ~96 KB/s, so the two together are ~192 KB/s; 90 minutes is ~1.0 GB.
+    private let maxMeetingAudioSeconds: Double = 90 * 60
 
     /// Window snapshot taken when the meeting started; we end the meeting only
     /// once this window disappears (not when focus is lost).
@@ -160,6 +171,19 @@ actor AudioCapture {
             log("[AudioCapture] failed to start audio: \(error.localizedDescription)\n")
             isInMeeting = false
         }
+
+        // The mic tap above hears the room. Add what the machine is playing so a
+        // call heard through headphones is recorded at all.
+        let system = SystemAudioCapture()
+        system.onSamples = { [weak self] data in
+            Task { await self?.appendSystemAudio(data) }
+        }
+        if await system.start() {
+            systemCapture = system
+            log("[AudioCapture] system audio capture started\n")
+        } else {
+            log("[AudioCapture] ⚠️ system audio unavailable — this meeting records the mic only\n")
+        }
     }
 
     private func endMeeting() async {
@@ -168,14 +192,19 @@ actor AudioCapture {
         isInMeeting = false
         audioEngine?.stop()
         audioEngine = nil
+        if let systemCapture { await systemCapture.stop() }
+        systemCapture = nil
 
         let endedAt = ISO8601DateFormatter().string(from: Date())
         let retainedSeconds = Double(retainedFrames) / max(audioSampleRate, 1)
         let vadPercent = totalBuffers > 0
             ? Double(vadPassedBuffers) / Double(totalBuffers) * 100
             : 0
-        log("[AudioCapture] meeting ended, \(String(format: "%.1f", retainedSeconds / 60)) min audio retained "
-            + "(VAD passed \(String(format: "%.0f", vadPercent))% of buffers), peak RMS \(String(format: "%.0f", peakRMS))\n")
+        let systemSeconds = Double(systemFrames) / max(audioSampleRate, 1)
+        log("[AudioCapture] meeting ended, \(String(format: "%.1f", retainedSeconds / 60)) min mic + "
+            + "\(String(format: "%.1f", systemSeconds / 60)) min system retained "
+            + "(VAD passed \(String(format: "%.0f", vadPercent))% of buffers), "
+            + "peak RMS mic \(String(format: "%.0f", peakRMS)) system \(String(format: "%.0f", systemPeakRMS))\n")
 
         // Snapshot meeting state into locals and clear actor state BEFORE any
         // await. Meetings flap (frontmost app changes every few seconds), so a
@@ -183,9 +212,12 @@ actor AudioCapture {
         // locals prevents the delayed resume from clobbering the new meeting.
         let session = currentMeetingSession
         let meetingApp = currentMeetingApp
-        // Pre-size the concatenation: a full meeting is ~96 KB/s, so growing this
-        // by repeated reallocation would copy hundreds of MB more than needed.
-        let fullAudio = meetingAudio.reduce(into: Data(capacity: retainedFrames * 2)) { $0.append($1) }
+        // Pre-size the concatenation: a full meeting is ~96 KB/s per source, so
+        // growing this by repeated reallocation would copy hundreds of MB more
+        // than needed. Mix before resetAudioBuffers() clears the buffers.
+        let micAudio = meetingAudio.reduce(into: Data(capacity: retainedFrames * 2)) { $0.append($1) }
+        let capturedSystemAudio = systemAudio.reduce(into: Data(capacity: systemFrames * 2)) { $0.append($1) }
+        let fullAudio = Self.mixSources(mic: micAudio, system: capturedSystemAudio)
 
         currentMeetingApp = nil
         meetingStartTime = nil
@@ -287,6 +319,54 @@ actor AudioCapture {
         }
     }
 
+    /// Append a chunk of system audio (48 kHz mono Int16, same as the mic).
+    private func appendSystemAudio(_ pcmData: Data) {
+        let frameCount = pcmData.count / 2
+        guard frameCount > 0 else { return }
+
+        totalBuffers += 1
+        let samples = pcmData.withUnsafeBytes { Array($0.bindMemory(to: Int16.self).prefix(frameCount)) }
+        if vadDetect(samples) { vadPassedBuffers += 1 }
+        if let rms = rmsLevel(samples), rms > systemPeakRMS { systemPeakRMS = rms }
+
+        if Double(systemFrames) / max(audioSampleRate, 1) >= maxMeetingAudioSeconds {
+            if !systemCapReached {
+                systemCapReached = true
+                log("[AudioCapture] ⚠️ system audio cap reached — dropping further system audio\n")
+            }
+            return
+        }
+        systemAudio.append(pcmData)
+        systemFrames += frameCount
+    }
+
+    /// Sum the mic and system streams.
+    ///
+    /// With headphones these are **disjoint speakers** — the mic carries only the
+    /// local voice and the system stream only the remote one — so summing produces
+    /// a conversation rather than an echo of it. The mic gets slightly less gain
+    /// because it carries room acoustics while the other side arrives as a clean
+    /// digital stream.
+    private static func mixSources(mic: Data, system: Data) -> Data {
+        let micCount = mic.count / 2
+        let systemCount = system.count / 2
+        guard systemCount > 0 else { return mic }
+        let count = max(micCount, systemCount)
+
+        var mixed = [Int16](repeating: 0, count: count)
+        mic.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for i in 0..<micCount { mixed[i] = samples[i] }
+        }
+        system.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            for i in 0..<systemCount {
+                mixed[i] = Int16(clamping: Int(mixed[i]) + Int(Double(samples[i]) * 0.85))
+            }
+        }
+        return mixed.withUnsafeBytes { Data($0) }
+    }
+
     private func resetAudioBuffers() {
         meetingAudio = []
         retainedFrames = 0
@@ -294,6 +374,10 @@ actor AudioCapture {
         vadPassedBuffers = 0
         audioCapReached = false
         peakRMS = 0
+        systemAudio = []
+        systemFrames = 0
+        systemPeakRMS = 0
+        systemCapReached = false
     }
 
     /// Simple energy-based VAD. Returns true if RMS exceeds threshold.
