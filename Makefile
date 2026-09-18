@@ -41,6 +41,8 @@ install: all
 	mkdir -p $(BIN_DIR) $(MODEL_DIR)
 	# Stop the daemon BEFORE replacing the binary — replacing a signed binary
 	# while it runs causes macOS to SIGKILL it ("Code Signature Invalid").
+	# `unload` alone is unreliable on modern macOS; `bootout` is the effective form.
+	launchctl bootout gui/$(shell id -u)/com.activitytracker.collector 2>/dev/null || true
 	launchctl unload $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist 2>/dev/null || true
 	cp $(BINARY) $(BIN_DIR)/activity-tracker
 	codesign --force --sign "ActivityTracker Dev" $(BIN_DIR)/activity-tracker 2>/dev/null || true
@@ -61,7 +63,12 @@ install: all
 daemon-install: install
 	mkdir -p $(HOME)/.local/share/activity-tracker/logs
 	sed 's|%HOME%|$(HOME)|g' launchd/com.activitytracker.collector.plist > $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
-	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist
+	# `launchctl load` is a NO-OP when the job is already loaded, which silently
+	# leaves the daemon running the PREVIOUS binary after a deploy — observed
+	# 2026-09-18, where the process kept its old PID and old code. Kickstart
+	# forces the restart whether or not the load did anything.
+	launchctl load $(HOME)/Library/LaunchAgents/com.activitytracker.collector.plist 2>/dev/null || true
+	launchctl kickstart -k gui/$(shell id -u)/com.activitytracker.collector
 	@echo ""
 	@echo "==> Daemon installed and started"
 	@echo "    Monitor: tail -f $(HOME)/.local/share/activity-tracker/logs/collector.log"
